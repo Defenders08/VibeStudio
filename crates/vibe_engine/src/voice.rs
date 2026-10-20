@@ -1,4 +1,5 @@
 //! Голос: один звучащий инструмент-инстанс. Рендерится покадрово без аллокаций.
+//! Панорама — равная мощность (constant power).
 
 use crate::registry::VoiceSrc;
 use crate::synth;
@@ -10,12 +11,14 @@ pub struct Voice {
     frames_left: usize,
     frames_total: usize,
     pub gain: f32,
+    /// −1..=1; равная мощность: L=cos((p+1)·π/4), R=sin((p+1)·π/4).
+    pan: f32,
     phase: f32,
     kick_pos: usize,
 }
 
 impl Voice {
-    pub fn new(src: VoiceSrc, key: u16, dur_secs: f32, gain: f32, sr: f32) -> Self {
+    pub fn new(src: VoiceSrc, key: u16, dur_secs: f32, gain: f32, pan: f32, sr: f32) -> Self {
         let total = ((dur_secs.max(0.01)) * sr) as usize;
         Voice {
             src,
@@ -24,6 +27,7 @@ impl Voice {
             frames_left: total,
             frames_total: total,
             gain,
+            pan: pan.clamp(-1.0, 1.0),
             phase: 0.0,
             kick_pos: 0,
         }
@@ -33,10 +37,12 @@ impl Voice {
         self.frames_left == 0
     }
 
-    /// Добавить голос в микс блока (моно). Голос сам не удаляется —
+    /// Добавить голос в стерео-блок (interleaved). Голос сам не удаляется —
     /// вызывающий отбрасывает по `finished()`.
     pub fn mix_block(&mut self, out: &mut [f32], kick: &[f32]) {
-        for (i, f) in out.iter_mut().enumerate() {
+        let angle = (self.pan + 1.0) * (std::f32::consts::FRAC_PI_4);
+        let (gl, gr) = (angle.cos(), angle.sin());
+        for frame in out.chunks_exact_mut(2) {
             if self.frames_left == 0 {
                 break;
             }
@@ -58,7 +64,9 @@ impl Voice {
                     0.75 * fundamental + 0.25 * harm
                 }
             };
-            *f += s * env * self.gain;
+            let v = s * env * self.gain;
+            frame[0] += v * gl;
+            frame[1] += v * gr;
         }
     }
 }

@@ -10,6 +10,6 @@ pub mod render;
 pub mod synth;
 pub mod voice;
 
-pub use engine::Engine;
-pub use registry::{EngineCommand, NoteEvent, VoiceSrc};
+pub use engine::{Engine, TransportSnapshot, TransportStatus};
+pub use registry::{ChannelVoice, EngineCommand, NoteEvent, PlayMode, VoiceSrc};
 pub use render::render_to_wav;

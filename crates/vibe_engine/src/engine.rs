@@ -1,17 +1,44 @@
 //! Аудиодвижок: cpal-вывод + планировщик событий + голоса.
 //!
+//! Единый источник времени: курсор в `PlayState` (кадры), публикуется атомарно
+//! (`pos_bits`) из аудио-колбэка; UI и offline-рендер читают только его.
 //! RT-дисциплина прототипа: команды — через rtrb-кольцо (без аллокаций в
 //! колбэке); состояние воспроизведения — под коротким Mutex (известный долг:
 //! заменить на тройной буфер по мере роста; см. OSS_AUDIT — паттерн maolan).
 //! Микширование и планирование общие с offline-рендером («what you hear is
 //! what you render», паттерн vibez).
 
-use crate::registry::{EngineCommand, NoteEvent, VoiceSrc};
+use crate::registry::{EngineCommand, NoteEvent, PlayMode, VoiceSrc};
 use crate::synth;
 use crate::voice::Voice;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Статус транспорта (публикуется атомарно; 0=Stopped, 1=Playing, 2=Paused).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportStatus {
+    Stopped,
+    Playing,
+    Paused,
+}
+
+impl TransportStatus {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => TransportStatus::Playing,
+            2 => TransportStatus::Paused,
+            _ => TransportStatus::Stopped,
+        }
+    }
+    fn to_u8(self) -> u8 {
+        match self {
+            TransportStatus::Stopped => 0,
+            TransportStatus::Playing => 1,
+            TransportStatus::Paused => 2,
+        }
+    }
+}
 
 /// Состояние воспроизведения: общее для live-колбэка и offline-рендера.
 pub struct PlayState {
@@ -19,11 +46,12 @@ pub struct PlayState {
     pub sample_rate: f32,
     pub cursor_frames: f64,
     pub loop_ticks: f32,
+    pub mode: PlayMode,
     pub events: Vec<NoteEvent>,
     next_event: usize,
     voices: Vec<Voice>,
     kick: Vec<f32>,
-    playing: bool,
+    status: TransportStatus,
     pub master: f32,
     /// моно-скратч блока (выделяется один раз под максимальный блок).
     scratch: Vec<f32>,
@@ -36,11 +64,12 @@ impl PlayState {
             sample_rate,
             cursor_frames: 0.0,
             loop_ticks: 384.0,
+            mode: PlayMode::Pat,
             events: Vec::new(),
             next_event: 0,
             voices: Vec::with_capacity(64),
             kick: synth::kick_sample(sample_rate),
-            playing: false,
+            status: TransportStatus::Stopped,
             master: 0.78,
             scratch: vec![0.0; 4096],
         }
@@ -54,30 +83,54 @@ impl PlayState {
         (self.cursor_frames / self.frames_per_tick()) as f32
     }
 
+    pub fn status(&self) -> TransportStatus {
+        self.status
+    }
+
+    fn resync_next_event(&mut self) {
+        let tick = self.tick_now();
+        self.next_event = 0;
+        while self.next_event < self.events.len()
+            && self.events[self.next_event].tick <= tick
+        {
+            self.next_event += 1;
+        }
+    }
+
     pub fn apply(&mut self, cmd: EngineCommand) {
         match cmd {
-            EngineCommand::Play { events, loop_ticks } => {
+            EngineCommand::Play { events, loop_ticks, mode } => {
                 self.events = events;
                 self.loop_ticks = loop_ticks.max(1.0);
-                self.cursor_frames = 0.0;
+                self.mode = mode;
                 self.next_event = 0;
-                self.playing = true;
+                self.status = TransportStatus::Playing;
+            }
+            EngineCommand::Pause => {
+                if self.status == TransportStatus::Playing {
+                    self.status = TransportStatus::Paused;
+                    self.voices.clear(); // заглушить звучащие голоса
+                }
             }
             EngineCommand::Stop => {
-                self.playing = false;
+                self.status = TransportStatus::Stopped;
                 self.cursor_frames = 0.0;
                 self.next_event = 0;
                 self.voices.clear();
             }
+            EngineCommand::SetMode { events, loop_ticks, mode } => {
+                // позиция в тиках сохраняется; события/цикл подменяются
+                self.events = events;
+                self.loop_ticks = loop_ticks.max(1.0);
+                self.mode = mode;
+                if self.cursor_frames > self.loop_ticks as f64 * self.frames_per_tick() {
+                    self.cursor_frames %= self.loop_ticks as f64 * self.frames_per_tick();
+                }
+                self.resync_next_event();
+            }
             EngineCommand::Seek { tick } => {
                 self.cursor_frames = (tick.max(0.0) as f64) * self.frames_per_tick();
-                self.next_event = 0;
-                let tick = self.tick_now();
-                while self.next_event < self.events.len()
-                    && self.events[self.next_event].tick <= tick
-                {
-                    self.next_event += 1;
-                }
+                self.resync_next_event();
             }
             EngineCommand::SetBpm { bpm } => {
                 if (1.0..=1000.0).contains(&bpm) {
@@ -87,12 +140,13 @@ impl PlayState {
                     self.cursor_frames = t as f64 * self.frames_per_tick();
                 }
             }
-            EngineCommand::PreviewNote { key, vel, dur_secs, gain, src } => {
+            EngineCommand::PreviewNote { key, vel, dur_secs, gain, pan, src } => {
                 self.spawn(Voice::new(
                     src,
                     key,
                     dur_secs,
                     gain * vel as f32 / 127.0,
+                    pan,
                     self.sample_rate,
                 ));
             }
@@ -117,18 +171,20 @@ impl PlayState {
             self.next_event += 1;
             let dur = ev.dur_ticks as f32 / 96.0 * 60.0 / self.bpm as f32;
             self.spawn(Voice::new(
-                ev.src,
+                ev.channel.src,
                 ev.key,
                 dur,
                 ev.gain * ev.vel as f32 / 127.0,
+                ev.channel.pan,
                 self.sample_rate,
             ));
         }
     }
 
     /// Продвинуть планировщик на `frames` кадров (с обработкой цикла).
+    /// На Stopped/Paused ничего не звучит и курсор не движется.
     pub fn advance(&mut self, frames: usize) {
-        if !self.playing {
+        if self.status != TransportStatus::Playing {
             return;
         }
         self.fire_due();
@@ -170,14 +226,14 @@ impl PlayState {
     }
 
     pub fn is_playing(&self) -> bool {
-        self.playing
+        self.status == TransportStatus::Playing
     }
 }
 
 /// Публичный хэндл движка (владение у UI; Stream живёт, пока жив Engine).
 pub struct Engine {
     cmd_tx: rtrb::Producer<EngineCommand>,
-    playing: Arc<AtomicBool>,
+    status_bits: Arc<AtomicU32>,
     pos_bits: Arc<AtomicU32>,
     state: Arc<Mutex<PlayState>>,
     stream: Option<cpal::Stream>,
@@ -185,11 +241,17 @@ pub struct Engine {
     pub silent: bool,
 }
 
+/// Снапшот транспорта для UI: статус + позиция в тиках — единый источник.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransportSnapshot {
+    pub status: TransportStatus,
+    pub tick: f32,
+}
+
 impl Engine {
     pub fn new() -> Engine {
-        let (tx, rx) = rtrb::RingBuffer::<EngineCommand>::new(256);
-        let mut rx = rx;
-        let playing = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = rtrb::RingBuffer::<EngineCommand>::new(256);
+        let status_bits = Arc::new(AtomicU32::new(0));
         let pos_bits = Arc::new(AtomicU32::new(0));
 
         // Состояние создаётся ДО стрима: колбэк получает клон Arc.
@@ -206,7 +268,7 @@ impl Engine {
                 let sr = cfg.sample_rate().0 as f32;
                 state_sr = sr;
                 let st = Arc::new(Mutex::new(PlayState::new(sr)));
-                let play = playing.clone();
+                let status = status_bits.clone();
                 let pos = pos_bits.clone();
                 let stc = st.clone();
                 let err_cb = |e| eprintln!("[vibe_engine] stream error: {e}");
@@ -224,18 +286,14 @@ impl Engine {
                     let n = data.len() / 2;
                     st.advance(n);
                     st.mix_block(data);
-                    play.store(st.is_playing(), Ordering::Relaxed);
+                    status.store(st.status().to_u8() as u32, Ordering::Relaxed);
                     pos.store(st.tick_now().to_bits(), Ordering::Relaxed);
                 };
                 if cfg.sample_format() != cpal::SampleFormat::F32 || cfg.channels() < 2 {
                     return Err("устройство не f32/стерео".into());
                 }
-                let stream = device.build_output_stream(
-                    &cfg.into(),
-                    data_cb,
-                    err_cb,
-                    None,
-                )?;
+                let stream =
+                    device.build_output_stream(&cfg.into(), data_cb, err_cb, None)?;
                 stream.play().ok();
                 Ok(stream)
             })() {
@@ -251,79 +309,76 @@ impl Engine {
             }
         };
 
-        Engine { cmd_tx: tx, playing, pos_bits, state, stream, silent }
+        Engine {
+            cmd_tx: tx,
+            status_bits,
+            pos_bits,
+            state,
+            stream,
+            silent,
+        }
     }
 
-    pub fn play(&mut self, events: Vec<NoteEvent>, loop_ticks: f32) {
+    /// Отправить команду в аудио-колбэк (или применить напрямую в silent-режиме).
+    fn send(&mut self, cmd: EngineCommand) {
         if self.silent {
             if let Ok(mut st) = self.state.lock() {
-                st.apply(EngineCommand::Play { events, loop_ticks });
+                st.apply(cmd);
+                self.status_bits
+                    .store(st.status().to_u8() as u32, Ordering::Relaxed);
+                self.pos_bits.store(st.tick_now().to_bits(), Ordering::Relaxed);
             }
             return;
         }
-        let _ = self.cmd_tx.push(EngineCommand::Play { events, loop_ticks });
+        let _ = self.cmd_tx.push(cmd);
+    }
+
+    /// Снапшот транспорта: ЕДИНЫЙ источник позиции и статуса для всего UI.
+    pub fn transport(&self) -> TransportSnapshot {
+        TransportSnapshot {
+            status: TransportStatus::from_u8(self.status_bits.load(Ordering::Relaxed) as u8),
+            tick: f32::from_bits(self.pos_bits.load(Ordering::Relaxed)),
+        }
+    }
+
+    pub fn play(&mut self, events: Vec<NoteEvent>, loop_ticks: f32, mode: PlayMode) {
+        self.send(EngineCommand::Play { events, loop_ticks, mode });
+    }
+
+    pub fn pause(&mut self) {
+        self.send(EngineCommand::Pause);
     }
 
     pub fn stop(&mut self) {
-        if self.silent {
-            if let Ok(mut st) = self.state.lock() {
-                st.apply(EngineCommand::Stop);
-            }
-            self.playing.store(false, Ordering::Relaxed);
-            return;
-        }
-        let _ = self.cmd_tx.push(EngineCommand::Stop);
+        self.send(EngineCommand::Stop);
     }
 
     pub fn seek(&mut self, tick: f32) {
-        if !self.silent && self.playing() {
-            let _ = self.cmd_tx.push(EngineCommand::Seek { tick });
-            return;
-        }
-        if let Ok(mut st) = self.state.lock() {
-            st.apply(EngineCommand::Seek { tick });
-            self.pos_bits.store(st.tick_now().to_bits(), Ordering::Relaxed);
-        }
+        self.send(EngineCommand::Seek { tick });
+    }
+
+    pub fn set_mode(&mut self, events: Vec<NoteEvent>, loop_ticks: f32, mode: PlayMode) {
+        self.send(EngineCommand::SetMode { events, loop_ticks, mode });
     }
 
     pub fn set_bpm(&mut self, bpm: f64) {
-        if self.silent {
-            if let Ok(mut st) = self.state.lock() {
-                st.apply(EngineCommand::SetBpm { bpm });
-            }
-            return;
-        }
-        let _ = self.cmd_tx.push(EngineCommand::SetBpm { bpm });
+        self.send(EngineCommand::SetBpm { bpm });
     }
 
-    /// Мгновенное превью (шаг/клавиша/нота) — слышно и на стопе.
-    pub fn preview(&mut self, key: u16, vel: u8, dur_secs: f32, gain: f32, src: VoiceSrc) {
-        if self.silent || !self.playing() {
-            // На стопе колбэк не микширует — кладём голос напрямую в состояние:
-            // он подхватится следующим блоком, когда стрим жив; в silent — оффлайн.
-            if let Ok(mut st) = self.state.lock() {
-                st.apply(EngineCommand::PreviewNote { key, vel, dur_secs, gain, src });
-            }
-            return;
-        }
-        let _ = self.cmd_tx.push(EngineCommand::PreviewNote { key, vel, dur_secs, gain, src });
+    /// Мгновенное превью (шаг/клавиша/нота) — слышно в любом статусе.
+    pub fn preview(
+        &mut self,
+        key: u16,
+        vel: u8,
+        dur_secs: f32,
+        gain: f32,
+        pan: f32,
+        src: VoiceSrc,
+    ) {
+        self.send(EngineCommand::PreviewNote { key, vel, dur_secs, gain, pan, src });
     }
 
     pub fn set_master_gain(&mut self, gain: f32) {
-        if self.silent {
-            if let Ok(mut st) = self.state.lock() {
-                st.apply(EngineCommand::SetMasterGain { gain });
-            }
-            return;
-        }
-        let _ = self.cmd_tx.push(EngineCommand::SetMasterGain { gain });
-    }
-
-    pub fn playing(&self) -> bool {
-        self.playing.load(Ordering::Relaxed)
-    }
-
-    pub fn position(&self) -> f32 {
-        f32::from_bits(self.pos_bits.load(Ordering::Relaxed))
+        self.send(EngineCommand::SetMasterGain { gain });
     }
 }

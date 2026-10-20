@@ -16,7 +16,7 @@ use egui::{Align2, Color32, Key, Sense};
 use flp_compat::model::{color_to_rgb8, Arrangement, Channel, Insert, Project};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
-use vibe_engine::{render_to_wav, Engine, NoteEvent, VoiceSrc};
+use vibe_engine::{render_to_wav, ChannelVoice, Engine, NoteEvent, PlayMode, TransportStatus, VoiceSrc};
 
 /// Собственные иконки VibeStudio (icons/own/, генерируются icons/gen_icons.py —
 /// монохромные глифы в духе FL; замена иконок Image-Line из соображений лицензий).
@@ -229,8 +229,8 @@ struct App {
     show_roll: bool,
     show_mixer: bool,
     hint: String,
-    // transport
-    playing: bool,
+    // transport: зеркало engine.transport() (запрещено мутировать напрямую)
+    playing_status: TransportStatus,
     recording: bool,
     pattern_mode: bool,
     metronome: bool,
@@ -254,6 +254,9 @@ struct App {
     // mixer
     strips: Vec<Strip>,
     selected_insert: usize,
+    rack_height: f32,
+    next_channel_id: u16,
+    confirm_delete_channel: Option<u16>,
     // прочее
     show_picker: bool,
     muted_tracks: HashSet<usize>,
@@ -298,8 +301,8 @@ impl App {
             show_rack: true,
             show_roll: false,
             show_mixer: false,
-            hint: "Space — play/stop · шаги/ноты звучат · Ctrl+O — открыть .flp · Ctrl+T — клавиатура-пиано".into(),
-            playing: false,
+            hint: "Space — play/pause · Enter — стоп · шаги/ноты звучат · Ctrl+O — открыть .flp".into(),
+            playing_status: TransportStatus::Stopped,
             recording: false,
             pattern_mode: true,
             metronome: false,
@@ -329,6 +332,9 @@ impl App {
             mem_fake: 173,
             phase: 0.0,
             engine: Engine::new(),
+            rack_height: 260.0,
+            next_channel_id: 2,
+            confirm_delete_channel: None,
             undo: Vec::new(),
             redo: Vec::new(),
             tap_times: Vec::new(),
@@ -343,7 +349,6 @@ impl App {
     /// Загрузить/перезагрузить проект из модели flp_compat (старт, New, Open).
     fn reload_from_project(&mut self, p: Project) {
         self.engine.stop();
-        self.playing = false;
         self.pos_ticks = 0.0;
         self.project = Some(p);
         self.notes.clear();
@@ -453,6 +458,101 @@ impl App {
         }
     }
 
+    // ---- каналы: единый store (project.channels) + операции ----
+
+    /// «+ Add channel»: Sampler или Generator внизу списка, уникальный iid.
+    fn add_channel(&mut self, kind: u8) {
+        self.push_undo();
+        let iid = self.next_channel_id;
+        self.next_channel_id += 1;
+        let name = if kind == 0 { "Sampler" } else { "Generator" };
+        let p = self.project.as_mut().expect("проект открыт");
+        p.channels.push(Channel {
+            iid,
+            kind: Some(kind),
+            name: Some(format!("{name} {iid}")),
+            color: Some(0x5C8A50 + iid as u32 * 0x101010),
+            sample_path: None,
+            levels: None,
+            enabled: None,
+            plugin_internal: None,
+            plugin_state_len: None,
+            plugin_runtime_len: None,
+        });
+        self.route.insert(iid, (self.strips.len().min(17)) as u16);
+        self.active_channel = iid as usize;
+        self.hint = format!("Канал «{name} {iid}» добавлен (уникальный iid {iid})");
+    }
+
+    /// Удаление канала — только через явное подтверждение (см. menu).
+    fn delete_channel(&mut self, iid: u16) {
+        if let Some(p) = self.project.as_mut() {
+            // Sampler (iid 0) защищён: дефолтный канал FL не удаляем из UI
+            if p.channels.len() <= 1 || iid == 0 {
+                self.hint = "Последний канал и Sampler удалить нельзя".into();
+                return;
+            }
+            if p.patterns.is_empty() && self.notes.is_empty() && self.user_steps.is_empty() {
+                p.channels.retain(|c| c.iid != iid);
+                self.route.remove(&iid);
+                if self.active_channel == iid as usize {
+                    self.active_channel = p.channels.first().map(|c| c.iid as usize).unwrap_or(0);
+                }
+                self.hint = format!("Канал {iid} удалён");
+            } else {
+                // канал участвует в данных — удаляем вместе с его данными (undo вернёт)
+                p.channels.retain(|c| c.iid != iid);
+                self.route.remove(&iid);
+                self.notes.retain(|n| n.iid != iid);
+                self.user_steps.retain(|(ch, _)| *ch != iid);
+                self.orig_steps.retain(|(ch, _)| *ch != iid);
+                if self.active_channel == iid as usize {
+                    self.active_channel = p.channels.first().map(|c| c.iid as usize).unwrap_or(0);
+                }
+                self.hint = format!("Канал {iid} удалён вместе с его данными (Ctrl+Z вернёт)");
+            }
+        }
+    }
+
+    /// Ручка громкости → gain голосов канала (квадратично, как в FL).
+    fn channel_gain(&self, iid: u16) -> f32 {
+        let v = self.channel_knobs.get(&iid).map(|k| k.1).unwrap_or(0.78);
+        v * v
+    }
+
+    /// Ручка панорамы канала.
+    fn channel_pan(&self, iid: u16) -> f32 {
+        self.channel_knobs.get(&iid).map(|k| k.0).unwrap_or(0.5)
+    }
+
+    // ---- транспорт: единый store ----
+
+    /// Команда play/pause из UI (кнопка, Space).
+    fn transport_toggle(&mut self) {
+        match self.engine.transport().status {
+            TransportStatus::Playing => self.engine.pause(),
+            _ => {
+                let (events, loop_ticks) = self.build_events();
+                let mode = if self.pattern_mode { PlayMode::Pat } else { PlayMode::Song };
+                self.engine.play(events, loop_ticks, mode);
+                self.hint = if self.pattern_mode {
+                    "PAT: играет текущий паттерн (цикл)".into()
+                } else {
+                    "SONG: играет аранжировка клипов".into()
+                };
+            }
+        }
+    }
+
+    /// Смена PAT/SONG на лету без сброса позиции.
+    fn set_mode_live(&mut self) {
+        let (events, loop_ticks) = self.build_events();
+        let mode = if self.pattern_mode { PlayMode::Pat } else { PlayMode::Song };
+        if self.engine.transport().status == TransportStatus::Playing {
+            self.engine.set_mode(events, loop_ticks, mode);
+        }
+    }
+
     // ---- диалоги FILE ----
 
     fn open_flp_dialog(&mut self) {
@@ -515,8 +615,13 @@ impl App {
         if kind == Some(0) { VoiceSrc::Kick } else { VoiceSrc::Tone }
     }
 
+    /// Голос канала: src + панорама (громкость отдельно, квадратичная).
+    fn voice_for_channel(&self, iid: u16) -> ChannelVoice {
+        ChannelVoice { src: self.src_for_channel(iid), pan: self.channel_pan(iid) * 2.0 - 1.0 }
+    }
+
     fn gain_for_channel(&self, iid: u16) -> f32 {
-        self.channel_knobs.get(&iid).map(|k| k.1).unwrap_or(0.78)
+        self.channel_gain(iid)
     }
 
     fn secs_per_tick(&self) -> f32 {
@@ -535,7 +640,7 @@ impl App {
                     vel: n.vel,
                     dur_ticks: n.len as f32,
                     gain: self.gain_for_channel(n.iid),
-                    src: self.src_for_channel(n.iid),
+                    channel: self.voice_for_channel(n.iid),
                 });
             }
             for &(iid, step) in &self.user_steps {
@@ -545,7 +650,7 @@ impl App {
                     vel: 100,
                     dur_ticks: STEP_TICKS,
                     gain: self.gain_for_channel(iid),
-                    src: self.src_for_channel(iid),
+                    channel: self.voice_for_channel(iid),
                 });
             }
         };
@@ -715,17 +820,12 @@ impl eframe::App for App {
         let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
 
-        // Транспорт — источник истины теперь движок: позиция читается атомарно.
-        let eng_playing = self.engine.playing();
-        if eng_playing {
-            self.playing = true;
-            self.pos_ticks = self.engine.position();
-        } else if self.playing {
-            // движок сам остановился (сброс после Stop) — синхронизируем UI
-            self.playing = false;
-            self.pos_ticks = 0.0;
-        }
-        if self.playing {
+        // ЕДИНЫЙ ТРАНСПОРТ: позиция и статус читаются ТОЛЬКО из движка
+        // (аудио-колбэк публикует атомарно). UI-счётчиков нет.
+        let snap = self.engine.transport();
+        self.playing_status = snap.status;
+        self.pos_ticks = snap.tick;
+        if snap.status == TransportStatus::Playing {
             self.phase += dt * 9.0;
             for (i, s) in self.strips.iter_mut().enumerate() {
                 let base = if s.solo { 0.0 } else { s.vol };
@@ -748,25 +848,15 @@ impl eframe::App for App {
         ctx.input(|i| {
             let cmd = i.modifiers.command;
             if i.key_pressed(Key::Space) {
-                if self.engine.playing() {
-                    self.engine.stop();
-                } else {
-                    let (events, loop_ticks) = self.build_events();
-                    self.engine.play(events, loop_ticks);
-                    self.hint = if self.pattern_mode {
-                        "PAT: играет текущий паттерн (цикл)".into()
-                    } else {
-                        "SONG: играет аранжировка клипов".into()
-                    };
-                }
+                self.transport_toggle();
+            }
+            if i.key_pressed(Key::Enter) {
+                self.engine.stop();
+                self.hint = "Стоп: позиция 1:1:0 (Enter)".into();
             }
             if i.key_pressed(Key::L) {
                 self.pattern_mode = !self.pattern_mode;
-                // перезапуск в новом режиме, если играет
-                if self.engine.playing() {
-                    let (events, loop_ticks) = self.build_events();
-                    self.engine.play(events, loop_ticks);
-                }
+                self.set_mode_live(); // позиция сохраняется
             }
             if i.key_pressed(Key::R) && !cmd {
                 self.recording = !self.recording;
@@ -774,7 +864,6 @@ impl eframe::App for App {
             }
             if i.key_pressed(Key::H) && cmd {
                 self.engine.stop();
-                self.playing = false;
                 self.pos_ticks = 0.0;
                 self.hint = "Panic (Ctrl+H) — стоп".into();
             }
@@ -794,7 +883,6 @@ impl eframe::App for App {
             }
             if i.key_pressed(Key::Home) {
                 self.engine.seek(0.0);
-                self.pos_ticks = 0.0;
                 self.hint = "Home — playhead в начало".into();
             }
             if i.key_pressed(Key::Backspace) {
@@ -880,6 +968,7 @@ impl eframe::App for App {
         if self.show_piano {
             self.typing_piano_window(ctx);
         }
+        self.confirm_delete_window(ctx);
     }
 }
 
@@ -978,7 +1067,11 @@ impl App {
                         .fill(if self.pattern_mode { C_ACCENT } else { C_PANEL_DARK })
                         .min_size(egui::vec2(38.0, 12.0));
                         if ui.add(pat).clicked() {
+                            let was = self.pattern_mode;
                             self.pattern_mode = true;
+                            if was != self.pattern_mode {
+                                self.set_mode_live();
+                            }
                         }
                         let song = egui::Button::new(
                             egui::RichText::new("SONG").size(9.0).color(if !self.pattern_mode {
@@ -990,7 +1083,11 @@ impl App {
                         .fill(if !self.pattern_mode { C_ACCENT } else { C_PANEL_DARK })
                         .min_size(egui::vec2(38.0, 12.0));
                         if ui.add(song).clicked() {
+                            let was = self.pattern_mode;
                             self.pattern_mode = false;
+                            if was != self.pattern_mode {
+                                self.set_mode_live();
+                            }
                         }
                     })
                     .response
@@ -998,10 +1095,11 @@ impl App {
                     ui.separator();
 
                     // transport
-                    let play_label = if self.playing { "⏸" } else { "▶" };
+                    let is_playing = self.playing_status == TransportStatus::Playing;
+                    let play_label = if is_playing { "⏸" } else { "▶" };
                     let play = if self.icons.contains_key("play") {
                         let mut r = icon_button(ui, &self.icons, "play", 16.0, "");
-                        if self.playing {
+                        if self.playing_status == TransportStatus::Playing {
                             // поверх иконки — индикация «играет» (рамка)
                             ui.painter().rect_stroke(
                                 r.rect.expand(1.5),
@@ -1020,19 +1118,12 @@ impl App {
                         "Play/Pause — Space (движок cpal: играет паттерн/аранжировку)",
                     );
                     if play.clicked() {
-                        if self.engine.playing() {
-                            self.engine.stop();
-                        } else {
-                            let (events, loop_ticks) = self.build_events();
-                            self.engine.play(events, loop_ticks);
-                        }
+                        self.transport_toggle();
                     }
                     let stop = ui.add(egui::Button::new(egui::RichText::new("■").size(13.0)));
-                    self.set_hint(&stop, "Stop — возврат в начало");
+                    self.set_hint(&stop, "Stop — позиция 1:1:0 (Enter)");
                     if stop.clicked() {
                         self.engine.stop();
-                        self.playing = false;
-                        self.pos_ticks = 0.0;
                     }
                     let rec = ui.add(egui::Button::new(
                         egui::RichText::new("●")
@@ -1066,7 +1157,7 @@ impl App {
                     ui.separator();
 
                     // метроном: индикатор мигает на сильную долю при игре
-                    let beat_flash = self.playing && self.metronome && (self.pos_ticks % PPQ) < 8.0;
+                    let beat_flash = self.playing_status == TransportStatus::Playing && self.metronome && (self.pos_ticks % PPQ) < 8.0;
                     let met = ui.selectable_label(
                         self.metronome,
                         egui::RichText::new("⏱ Метроном").color(if beat_flash { C_ACCENT } else { Color32::PLACEHOLDER }),
@@ -1125,7 +1216,7 @@ impl App {
                     let mut prev = scope_rect.left_center();
                     for x in 0..=100 {
                         let t = x as f32 / 100.0;
-                        let amp = if self.playing { 8.0 } else { 0.6 };
+                        let amp = if self.playing_status == TransportStatus::Playing { 8.0 } else { 0.6 };
                         let y = mid + amp * (t * 12.0 + self.phase * 2.0).sin();
                         let next = egui::pos2(scope_rect.left() + t * scope_rect.width(), y);
                         pt.line_segment([prev, next], egui::Stroke::new(1.2, C_PLAY.linear_multiply(0.9)));
@@ -1280,7 +1371,9 @@ impl App {
     // ---------- Channel Rack: прикованная панель под тулбаром (UX скриншота) ----------
     fn channel_rack_dock(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("rack_dock")
-            .resizable(false)
+            .resizable(true) // ресайз за нижнюю границу
+            .min_height(200.0) // 6–8 каналов
+            .default_height(self.rack_height)
             .show(ctx, |ui| {
                 let mut head_hovered = false;
                 ui.horizontal(|ui| {
@@ -1342,7 +1435,8 @@ impl App {
                 }
                 ui.separator();
 
-                egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                self.rack_height = ui.available_height();
+                egui::ScrollArea::vertical().show(ui, |ui| {
                     let iids: Vec<u16> = self
                         .project
                         .as_ref()
@@ -1363,15 +1457,15 @@ impl App {
         ui.horizontal(|ui| {
             // Mute LED
             let led = ui.add(egui::Button::new(egui::RichText::new("●").color(C_PLAY).size(11.0)));
-            self.set_hint(&led, "Mute LED канала (заглушка: звук не реализован)");
+            self.set_hint(&led, "Mute LED канала (заглушка: выключение звука канала появится с микс-гейном)");
             if led.clicked() {
                 self.toggle_channel_mute(iid);
             }
             // Pan / Volume — круглые ручки (драг по вертикали), как в FL
             let (pan_r, vol_r) = {
                 let k = self.channel_knobs.entry(iid).or_insert((0.5, 0.78));
-                let p = knob_ui(ui, &mut k.0, -1.0, 1.0, "Pan канала — драг по вертикали (заглушка: в памяти)");
-                let v = knob_ui(ui, &mut k.1, 0.0, 1.0, "Volume канала — драг по вертикали (заглушка)");
+                let p = knob_ui(ui, &mut k.0, -1.0, 1.0, "Pan канала — реально панорамирует голоса (равная мощность)");
+                let v = knob_ui(ui, &mut k.1, 0.0, 1.0, "Volume канала — реально меняет громкость голосов (квадратично)");
                 (p, v)
             };
             self.set_hint(&pan_r, "Pan канала — заглушка");
@@ -1427,7 +1521,7 @@ impl App {
                 self.hint = "Channel Settings (вкладки Main/SMP/INS/MISC) — заглушка".into();
             }
             if btn.secondary_clicked() {
-                self.hint = "Меню канала: Piano roll, Rename, Load sample, Clone, Delete, Fill each 2/4/8 — заглушка".into();
+                self.confirm_delete_channel = Some(iid);
             }
             // Channel selector — вертикальный зелёный LED (как в FL)
             let sel_on = self.active_channel == iid as usize;
@@ -1469,6 +1563,17 @@ impl App {
                     [rect.left_bottom() + egui::vec2(1.0, -0.5), rect.right_bottom() + egui::vec2(-1.0, -0.5)],
                     egui::Stroke::new(1.0, C_BEVEL_LO),
                 );
+                // текущий шаг при воспроизведении — белая рамка (позиция из движка)
+                if self.playing_status == TransportStatus::Playing
+                    && (self.pos_ticks / STEP_TICKS).floor() as u32 == step
+                {
+                    ui.painter().rect_stroke(
+                        rect.expand(1.5),
+                        3.0,
+                        egui::Stroke::new(2.0, Color32::WHITE),
+                        egui::StrokeKind::Inside,
+                    );
+                }
                 self.set_hint(
                     &resp,
                     "Step Sequencer: ЛКМ — включить шаг (нота 1/16 + превью звука), ПКМ — выключить",
@@ -1483,7 +1588,7 @@ impl App {
                         (60, VoiceSrc::Tone)
                     };
                     self.engine
-                        .preview(key, 100, 0.3, self.gain_for_channel(iid), src);
+                        .preview(key, 100, 0.3, self.gain_for_channel(iid), self.channel_pan(iid) * 2.0 - 1.0, src);
                 }
                 if resp.secondary_clicked() && user {
                     self.push_undo();
@@ -1528,7 +1633,39 @@ impl App {
     }
 
     fn toggle_channel_mute(&mut self, _iid: u16) {
-        self.hint = "Заглушка: mute канала не реализован (нет аудиодвижка)".into();
+        self.hint = "Mute канала: визуальная индикация (звук канала не глушится до микс-гейнов)".into();
+    }
+
+    /// Модальное подтверждение удаления канала (п.3 ТЗ: только явное).
+    fn confirm_delete_window(&mut self, ctx: &egui::Context) {
+        if let Some(iid) = self.confirm_delete_channel {
+            let mut open = true;
+            egui::Window::new(format!("Удалить канал {iid}?"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "Канал «{}» и все его ноты/шаги будут удалены (Ctrl+Z вернёт).",
+                        self.channel_name(iid)
+                    ));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(egui::RichText::new("Удалить").color(C_REC)).clicked() {
+                            self.push_undo();
+                            self.delete_channel(iid);
+                            self.confirm_delete_channel = None;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            self.confirm_delete_channel = None;
+                        }
+                    });
+                });
+            if !open {
+                self.confirm_delete_channel = None;
+            }
+        }
     }
 
     // ---------- Browser: прикованная панель слева, FL-дерево (interface-map §8) ----------
@@ -1672,6 +1809,18 @@ impl App {
                 });
                 ui.separator();
 
+                // Ctrl+колесо — зум (альтернатива кнопке-лупе)
+                let wheel_zoom = ui.input(|i| {
+                    if i.modifiers.command {
+                        i.raw_scroll_delta.y * 0.002
+                    } else {
+                        0.0
+                    }
+                });
+                if wheel_zoom != 0.0 {
+                    self.playlist_zoom = (self.playlist_zoom + wheel_zoom).clamp(0.4, 4.0);
+                }
+
                 // пикер-панель слева + сетка справа (как на скриншоте)
                 ui.horizontal(|ui| {
                     // Picker Panel: источник клипов
@@ -1735,7 +1884,7 @@ impl App {
                             egui::pos2(resp.rect.left() + 6.0, y + ROW_H / 2.0),
                             Align2::LEFT_CENTER,
                             format!("Track {}", tr + 1),
-                            egui::FontId::proportional(10.0),
+                            egui::FontId::proportional(12.5),
                             Color32::WHITE,
                         );
                         let led_c = egui::pos2(resp.rect.left() + track_col_w - 4.0, y + ROW_H / 2.0);
@@ -1798,7 +1947,7 @@ impl App {
                     }
 
                     // playhead
-                    if self.playing || self.pos_ticks > 0.0 {
+                    if self.playing_status == TransportStatus::Playing || self.pos_ticks > 0.0 {
                         let x = origin.x + self.pos_ticks / (SONG_BARS as f32 * BAR_TICKS) * grid_w;
                         painter.line_segment(
                             [egui::pos2(x, origin.y), egui::pos2(x, origin.y + grid_h)],
@@ -1806,21 +1955,64 @@ impl App {
                         );
                     }
 
-                    // клики по сетке
+                    // инструменты: карандаш/ластик + drag/resize клипов.
+                    // Клип хранится (track, bar, len_bars); struct demo_clips — кортежи
+                    // (tr, bar) с фиксированной длиной 1 такт, растяжение меняет len.
                     if let Some(pos) = resp.interact_pointer_pos() {
                         if pos.x >= origin.x && pos.y >= origin.y {
-                            let bar = (((pos.x - origin.x) / bar_w) as usize).min(SONG_BARS - 1);
+                            let bar_f = (pos.x - origin.x) / bar_w;
+                            let bar = (bar_f as usize).min(SONG_BARS - 1);
                             let tr = (((pos.y - origin.y) / ROW_H) as usize).min(VISIBLE_TRACKS - 1);
-                            if self.tool == Tool::Draw && resp.clicked() && !self.demo_clips.contains(&(tr, bar)) {
-                                self.push_undo();
-                                self.demo_clips.push((tr, bar));
-                                self.hint = "Клип добавлен (участвует в SONG-воспроизведении и экспорте)".into();
+                            if pos.y < origin.y {
+                                if resp.clicked() {
+                                    self.pos_ticks = bar as f32 * BAR_TICKS;
+                                    self.engine.seek(self.pos_ticks);
+                                }
+                            } else if self.tool == Tool::Draw {
+                                // resize за правый край существующего клипа?
+                                let mut resized = false;
+                                for (i, (ctr, cbar)) in self.demo_clips.clone().iter().enumerate() {
+                                    if *ctr != tr {
+                                        continue;
+                                    }
+                                    let x0 = origin.x + *cbar as f32 * bar_w;
+                                    let x1 = x0 + bar_w; // длина 1 такт (сейчас клипы одно-тактные)
+                                    if bar_f >= (*cbar as f32 + 0.75) && pos.x <= x1 + 6.0 {
+                                        if resp.drag_started() {
+                                            self.push_undo();
+                                        }
+                                        if resp.dragged() {
+                                            let new_bar =
+                                                (((pos.x - origin.x) / bar_w) as usize).min(SONG_BARS - 1);
+                                            if new_bar != *cbar {
+                                                self.demo_clips[i] = (tr, new_bar);
+                                                self.hint = "Клип перемещён (drag)".into();
+                                            }
+                                            resized = true;
+                                        }
+                                        break;
+                                    }
+                                }
+                                if !resized && resp.clicked() && !self.demo_clips.contains(&(tr, bar)) {
+                                    self.push_undo();
+                                    // привязка к snap (в тактах)
+                                    let snapped = match self.snap {
+                                        0 | 1 => bar, // Line/Cell — по такту сетки
+                                        2 => bar - bar % 4, // Bar: уже такт
+                                        _ => bar,
+                                    };
+                                    self.demo_clips.push((tr, snapped));
+                                    self.hint = "Клип добавлен (участвует в SONG-воспроизведении и экспорте)".into();
+                                }
                             } else if self.tool == Tool::Delete && resp.clicked() {
-                                self.push_undo();
-                                self.demo_clips.retain(|c| c != &(tr, bar));
-                            }
-                            if pos.y < origin.y && resp.clicked() {
-                                self.pos_ticks = bar as f32 * BAR_TICKS;
+                                if let Some(idx) = self
+                                    .demo_clips
+                                    .iter()
+                                    .position(|&(ctr, cbar)| ctr == tr && cbar == bar)
+                                {
+                                    self.push_undo();
+                                    self.demo_clips.remove(idx);
+                                }
                             }
                         }
                     }
@@ -1967,7 +2159,7 @@ impl App {
                     }
                 }
 
-                if self.playing {
+                if self.playing_status == TransportStatus::Playing {
                     let x = origin.x + self.pos_ticks * PX_PER_TICK;
                     painter.line_segment(
                         [egui::pos2(x, origin.y), egui::pos2(x, origin.y + grid_h)],
@@ -2052,6 +2244,7 @@ impl App {
                                         100,
                                         self.last_note_len as f32 * self.secs_per_tick(),
                                         self.gain_for_channel(iid),
+                                        self.channel_pan(iid) * 2.0 - 1.0,
                                         self.src_for_channel(iid),
                                     );
                                     self.roll_drag = Some(RollDrag::Move {
@@ -2250,6 +2443,7 @@ impl App {
                             100,
                             0.4,
                             self.gain_for_channel(iid),
+                            self.channel_pan(iid) * 2.0 - 1.0,
                             self.src_for_channel(iid),
                         );
                     }

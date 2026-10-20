@@ -28,6 +28,7 @@ pub fn render_to_wav(
     st.apply(crate::registry::EngineCommand::Play {
         events: events.to_vec(),
         loop_ticks,
+        mode: crate::registry::PlayMode::Pat,
     });
     // устанавливаем bpm после Play (Play не сбрасывает bpm, но для ясности)
     st.apply(crate::registry::EngineCommand::SetBpm { bpm });

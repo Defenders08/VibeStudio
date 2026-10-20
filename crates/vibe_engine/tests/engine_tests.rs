@@ -1,11 +1,20 @@
 //! Тесты движка: кик, голоса, offline-рендер, WAV, registry-покрытие.
 
-use vibe_engine::registry::{EngineCommand, NoteEvent, REGISTRY, VoiceSrc};
+use vibe_engine::registry::{
+    ChannelVoice, EngineCommand, NoteEvent, PlayMode, REGISTRY, VoiceSrc,
+};
 use vibe_engine::render::render_to_wav;
 use vibe_engine::synth;
 
 fn ev(tick: f32, key: u16) -> NoteEvent {
-    NoteEvent { tick, key, vel: 100, dur_ticks: 48.0, gain: 0.78, src: VoiceSrc::Kick }
+    NoteEvent {
+        tick,
+        key,
+        vel: 100,
+        dur_ticks: 48.0,
+        gain: 0.78,
+        channel: ChannelVoice { src: VoiceSrc::Kick, pan: 0.0 },
+    }
 }
 
 #[test]
@@ -22,11 +31,13 @@ fn kick_sample_sane() {
 #[test]
 fn registry_covers_all_commands() {
     let samples: Vec<EngineCommand> = vec![
-        EngineCommand::Play { events: vec![], loop_ticks: 384.0 },
+        EngineCommand::Play { events: vec![], loop_ticks: 384.0, mode: PlayMode::Pat },
+        EngineCommand::Pause,
         EngineCommand::Stop,
         EngineCommand::Seek { tick: 0.0 },
         EngineCommand::SetBpm { bpm: 120.0 },
-        EngineCommand::PreviewNote { key: 60, vel: 100, dur_secs: 0.2, gain: 0.8, src: VoiceSrc::Tone },
+        EngineCommand::SetMode { events: vec![], loop_ticks: 384.0, mode: PlayMode::Song },
+        EngineCommand::PreviewNote { key: 60, vel: 100, dur_secs: 0.2, gain: 0.8, pan: 0.0, src: VoiceSrc::Tone },
         EngineCommand::SetMasterGain { gain: 0.78 },
     ];
     let n_variants = samples.len();
