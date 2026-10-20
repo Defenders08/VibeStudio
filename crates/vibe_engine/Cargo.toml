@@ -1,0 +1,11 @@
+[package]
+name = "vibe_engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Аудиодвижок VibeStudio: cpal-вывод, голоса (сэмплер+синт), offline-рендер WAV, registry-first ядро команд"
+
+[dependencies]
+cpal = "0.15"
+rtrb = "0.3"
+hound = "3"

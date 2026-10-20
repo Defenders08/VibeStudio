@@ -13,9 +13,10 @@
 
 use eframe::egui;
 use egui::{Align2, Color32, Key, Sense};
-use flp_compat::model::{color_to_rgb8, Project};
+use flp_compat::model::{color_to_rgb8, Arrangement, Channel, Insert, Project};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
+use vibe_engine::{render_to_wav, Engine, NoteEvent, VoiceSrc};
 
 /// Собственные иконки VibeStudio (icons/own/, генерируются icons/gen_icons.py —
 /// монохромные глифы в духе FL; замена иконок Image-Line из соображений лицензий).
@@ -27,7 +28,7 @@ const PATTERN_TICKS: f32 = BAR_TICKS; // паттерн длины 0 = один 
 const SONG_BARS: usize = 16;
 const STEP_TICKS: f32 = PPQ / 4.0; // шаг = 1/16
 const VERSION_LINE: &str =
-    "VibeStudio Prototype v0.1.0 — flp_compat · FL 25.2.4.4960 — звук не реализован (заглушки)";
+    "VibeStudio Prototype v0.2.0 — flp_compat · vibe_engine (cpal) · звук включён";
 
 // ---- Палитра FL 21 (Platinum-скин), снята со скриншотов мануала ----
 const C_BG: Color32 = Color32::from_rgb(0x23, 0x25, 0x27); // рабочий стол
@@ -145,6 +146,11 @@ fn painter_rect(ui: &egui::Ui, rect: egui::Rect, color: Color32) {
     ui.painter().rect_filled(rect, 1.0, color);
 }
 
+/// Позиция ноты → индекс шага 1/16.
+fn orig_steps_insert(set: &mut HashSet<(u16, u32)>, iid: u16, position: u32) {
+    set.insert((iid, (position as f32 / STEP_TICKS) as u32));
+}
+
 /// Круглая ручка в стиле FL: тёмный круг + индикатор; драг по вертикали меняет значение.
 fn knob_ui(ui: &mut egui::Ui, value: &mut f32, lo: f32, hi: f32, tip: &'static str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), Sense::drag());
@@ -184,6 +190,7 @@ enum RollDrag {
     Resize { idx: usize },
 }
 
+#[derive(Clone, Copy)]
 struct UiNote {
     iid: u16,
     pos: u32,
@@ -200,6 +207,15 @@ struct Strip {
     level: f32,
     name: Option<String>,
     slots: Vec<String>,
+}
+
+/// Снапшот редактируемого состояния для undo (ноты/шаги/клипы/темп).
+#[derive(Clone)]
+struct UndoSnap {
+    notes: Vec<UiNote>,
+    user_steps: HashSet<(u16, u32)>,
+    demo_clips: Vec<(usize, usize)>,
+    bpm: f64,
 }
 
 struct App {
@@ -247,6 +263,12 @@ struct App {
     cpu_fake: f32,
     mem_fake: u32,
     phase: f32,
+    // звук
+    engine: Engine,
+    undo: Vec<UndoSnap>,
+    redo: Vec<UndoSnap>,
+    tap_times: Vec<Instant>,
+    show_piano: bool,
 }
 
 impl App {
@@ -267,63 +289,8 @@ impl App {
             Err(e) => (None, Some(format!("{e}"))),
         };
 
-        let mut notes = Vec::new();
-        let mut orig_steps = HashSet::new();
-        let mut route = std::collections::HashMap::new();
-        if let Some(p) = &project {
-            if let Some(pat) = p.patterns.first() {
-                for n in &pat.notes {
-                    if (n.position as f32) < PATTERN_TICKS {
-                        orig_steps
-                            .insert((n.channel_iid, (n.position as f32 / STEP_TICKS) as u32));
-                    }
-                    notes.push(UiNote {
-                        iid: n.channel_iid,
-                        pos: n.position,
-                        len: n.length_ticks.max(1),
-                        key: n.key,
-                        vel: n.velocity,
-                    });
-                }
-            }
-            for c in &p.channels {
-                route.insert(c.iid, c.iid + 1); // заглушка: реальный routing (0x16) не декодирован
-            }
-        }
-
-        let mut strips = Vec::new();
-        if let Some(p) = &project {
-            for ins in &p.inserts {
-                strips.push(Strip {
-                    vol: 0.78,
-                    pan: 0.5,
-                    mute: false,
-                    solo: false,
-                    level: 0.0,
-                    name: ins.name.clone(),
-                    slots: ins.slots.iter().filter_map(|s| s.name.clone()).collect(),
-                });
-            }
-        }
-        if strips.is_empty() {
-            strips.push(Strip {
-                vol: 0.78,
-                pan: 0.5,
-                mute: false,
-                solo: false,
-                level: 0.0,
-                name: Some("Master".into()),
-                slots: vec![],
-            });
-        }
-
-        let mut demo_clips = Vec::new();
-        if project.is_some() {
-            demo_clips.push((0usize, 0usize));
-        }
-
-        Self {
-            project,
+        let mut app = Self {
+            project: None,
             load_error,
             icons,
             show_browser: true,
@@ -331,7 +298,7 @@ impl App {
             show_rack: true,
             show_roll: false,
             show_mixer: false,
-            hint: "Наведите курсор на элемент — подсказка (hint bar, как в FL). Space — play/stop; звук не реализован.".into(),
+            hint: "Space — play/stop · шаги/ноты звучат · Ctrl+O — открыть .flp · Ctrl+T — клавиатура-пиано".into(),
             playing: false,
             recording: false,
             pattern_mode: true,
@@ -341,17 +308,17 @@ impl App {
             last_frame: Instant::now(),
             time_as_clock: false,
             current_pattern: 0,
-            notes,
+            notes: Vec::new(),
             user_steps: HashSet::new(),
-            orig_steps,
+            orig_steps: HashSet::new(),
             selected_note: None,
-            active_channel: 1,
+            active_channel: 0,
             last_note_len: 48,
-            route,
-            demo_clips,
+            route: std::collections::HashMap::new(),
+            demo_clips: Vec::new(),
             tool: Tool::Draw,
             playlist_zoom: 1.0,
-            strips,
+            strips: Vec::new(),
             selected_insert: 0,
             show_picker: false,
             muted_tracks: HashSet::new(),
@@ -361,6 +328,308 @@ impl App {
             cpu_fake: 2.0,
             mem_fake: 173,
             phase: 0.0,
+            engine: Engine::new(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            tap_times: Vec::new(),
+            show_piano: false,
+        };
+        if let Some(p) = project {
+            app.reload_from_project(p);
+        }
+        app
+    }
+
+    /// Загрузить/перезагрузить проект из модели flp_compat (старт, New, Open).
+    fn reload_from_project(&mut self, p: Project) {
+        self.engine.stop();
+        self.playing = false;
+        self.pos_ticks = 0.0;
+        self.project = Some(p);
+        self.notes.clear();
+        self.user_steps.clear();
+        self.orig_steps.clear();
+        self.route.clear();
+        let p = self.project.as_ref().unwrap();
+        if let Some(pat) = p.patterns.first() {
+            for n in &pat.notes {
+                if (n.position as f32) < PATTERN_TICKS {
+                    orig_steps_insert(&mut self.orig_steps, n.channel_iid, n.position);
+                }
+                self.notes.push(UiNote {
+                    iid: n.channel_iid,
+                    pos: n.position,
+                    len: n.length_ticks.max(1),
+                    key: n.key,
+                    vel: n.velocity,
+                });
+            }
+        }
+        for c in &p.channels {
+            self.route.insert(c.iid, c.iid + 1); // заглушка: реальный routing (0x16) не декодирован
+        }
+        self.strips = p
+            .inserts
+            .iter()
+            .map(|ins| Strip {
+                vol: 0.78,
+                pan: 0.5,
+                mute: false,
+                solo: false,
+                level: 0.0,
+                name: ins.name.clone(),
+                slots: ins.slots.iter().filter_map(|s| s.name.clone()).collect(),
+            })
+            .collect();
+        if self.strips.is_empty() {
+            self.strips.push(Strip {
+                vol: 0.78,
+                pan: 0.5,
+                mute: false,
+                solo: false,
+                level: 0.0,
+                name: Some("Master".into()),
+                slots: vec![],
+            });
+        }
+        self.current_pattern = 0;
+        self.selected_note = None;
+        self.muted_tracks.clear();
+        self.roll_drag = None;
+        self.demo_clips = vec![(0, 0)];
+        self.active_channel = p.channels.first().map(|c| c.iid as usize).unwrap_or(0);
+        if let Some(bpm) = p.tempo_bpm {
+            self.bpm = bpm;
+            self.engine.set_bpm(bpm);
+        }
+        self.engine.set_master_gain(self.strips[0].vol);
+        self.undo.clear();
+        self.redo.clear();
+    }
+
+    /// Пустой проект «New» (как дефолт FL: один канал Sampler, без паттернов).
+    fn default_project() -> Project {
+        Project {
+            header: flp_compat::Header { format: 0, channels_field: 1, ppq: 96 },
+            data_len: 0,
+            trailing_bytes: 0,
+            tempo_bpm: Some(120.0),
+            legacy_tempo: None,
+            time_signature: Some((4, 4)),
+            version_string: None,
+            banner: None,
+            artists: None,
+            ac_payload: None,
+            channels: vec![Channel {
+                iid: 0,
+                kind: Some(0),
+                name: Some("Sampler".into()),
+                color: None,
+                sample_path: None,
+                levels: None,
+                enabled: None,
+                plugin_internal: None,
+                plugin_state_len: None,
+                plugin_runtime_len: None,
+            }],
+            patterns: Vec::new(),
+            arrangements: vec![Arrangement {
+                id: 0,
+                name: Some("Arrangement".into()),
+                clips: Vec::new(),
+                track_event_count: 0,
+            }],
+            inserts: vec![Insert {
+                index: 0,
+                name: None,
+                color: None,
+                routing: None,
+                slots: Vec::new(),
+                flags_raw: None,
+            }],
+            mixer_params: Vec::new(),
+            warnings: Vec::new(),
+            unknown_opcodes: Default::default(),
+        }
+    }
+
+    // ---- диалоги FILE ----
+
+    fn open_flp_dialog(&mut self) {
+        let file = rfd::FileDialog::new()
+            .add_filter("FL Studio project", &["flp"])
+            .set_title("Открыть .flp");
+        if let Some(path) = file.pick_file() {
+            match std::fs::read(&path)
+                .map_err(|e| format!("{e}"))
+                .and_then(|bytes| flp_compat::parse(&bytes).map_err(|e| format!("{e}")))
+            {
+                Ok(p) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    self.reload_from_project(p);
+                    self.hint = format!(
+                        "Открыт {name}: {} каналов, {} паттернов, {} нот",
+                        self.project.as_ref().map(|p| p.channels.len()).unwrap_or(0),
+                        self.project.as_ref().map(|p| p.patterns.len()).unwrap_or(0),
+                        self.notes.len()
+                    );
+                }
+                Err(e) => {
+                    self.load_error = Some(e.clone());
+                    self.hint = format!("Не удалось открыть: {e}");
+                }
+            }
+        }
+    }
+
+    fn export_wav_dialog(&mut self) {
+        let file = rfd::FileDialog::new()
+            .add_filter("WAV", &["wav"])
+            .set_file_name("vibestudio_export.wav")
+            .set_title("Экспорт WAV (offline render)");
+        if let Some(path) = file.save_file() {
+            let (events, loop_ticks) = self.build_events();
+            let loops = if self.pattern_mode { 2 } else { 1 };
+            match render_to_wav(&events, loop_ticks, self.bpm, loops, &path) {
+                Ok(frames) => {
+                    let secs = frames as f64 / 44_100.0;
+                    self.hint = format!("Экспорт: {} кадров ({secs:.1} c) → {}", frames, path.display());
+                }
+                Err(e) => self.hint = format!("Экспорт не удался: {e}"),
+            }
+        }
+    }
+
+    // ---- звук: события движка из текущего состояния ----
+
+    /// Источник голоса канала: sampler (kind 0) → сэмпл-кик, иначе тон.
+    fn src_for_channel(&self, iid: u16) -> VoiceSrc {
+        let kind = self
+            .project
+            .as_ref()
+            .and_then(|p| p.channels.iter().find(|c| c.iid == iid))
+            .and_then(|c| c.kind);
+        if kind == Some(0) { VoiceSrc::Kick } else { VoiceSrc::Tone }
+    }
+
+    fn gain_for_channel(&self, iid: u16) -> f32 {
+        self.channel_knobs.get(&iid).map(|k| k.1).unwrap_or(0.78)
+    }
+
+    fn secs_per_tick(&self) -> f32 {
+        60.0 / self.bpm as f32 / 96.0
+    }
+
+    /// События воспроизведения: PAT — текущий паттерн (ноты + пользовательские
+    /// шаги), SONG — клипы плейлиста (клип = экземпляр паттерна со смещением).
+    fn build_events(&self) -> (Vec<NoteEvent>, f32) {
+        let mut ev = Vec::new();
+        let mut push_pattern = |ev: &mut Vec<NoteEvent>, offset: f32| {
+            for n in &self.notes {
+                ev.push(NoteEvent {
+                    tick: offset + n.pos as f32,
+                    key: n.key,
+                    vel: n.vel,
+                    dur_ticks: n.len as f32,
+                    gain: self.gain_for_channel(n.iid),
+                    src: self.src_for_channel(n.iid),
+                });
+            }
+            for &(iid, step) in &self.user_steps {
+                ev.push(NoteEvent {
+                    tick: offset + step as f32 * STEP_TICKS,
+                    key: 60,
+                    vel: 100,
+                    dur_ticks: STEP_TICKS,
+                    gain: self.gain_for_channel(iid),
+                    src: self.src_for_channel(iid),
+                });
+            }
+        };
+        if self.pattern_mode {
+            push_pattern(&mut ev, 0.0);
+            (ev, PATTERN_TICKS)
+        } else {
+            for &(tr, bar) in &self.demo_clips {
+                if !self.muted_tracks.contains(&tr) {
+                    push_pattern(&mut ev, bar as f32 * BAR_TICKS);
+                }
+            }
+            (ev, SONG_BARS as f32 * BAR_TICKS)
+        }
+    }
+
+    // ---- undo/redo (снапшоты редактируемого состояния) ----
+
+    fn snapshot(&self) -> UndoSnap {
+        UndoSnap {
+            notes: self.notes.clone(),
+            user_steps: self.user_steps.clone(),
+            demo_clips: self.demo_clips.clone(),
+            bpm: self.bpm,
+        }
+    }
+
+    fn push_undo(&mut self) {
+        self.redo.clear();
+        self.undo.push(self.snapshot());
+        if self.undo.len() > 50 {
+            self.undo.remove(0);
+        }
+    }
+
+    fn apply_snap(&mut self, s: UndoSnap) {
+        self.notes = s.notes;
+        self.user_steps = s.user_steps;
+        self.demo_clips = s.demo_clips;
+        if self.bpm != s.bpm {
+            self.bpm = s.bpm;
+            self.engine.set_bpm(s.bpm);
+        }
+        self.selected_note = None;
+        self.roll_drag = None;
+    }
+
+    fn undo(&mut self) {
+        if let Some(s) = self.undo.pop() {
+            self.redo.push(self.snapshot());
+            self.apply_snap(s);
+            self.hint = "Undo (Ctrl+Z)".into();
+        } else {
+            self.hint = "Undo: история пуста".into();
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(s) = self.redo.pop() {
+            self.undo.push(self.snapshot());
+            self.apply_snap(s);
+            self.hint = "Redo (Ctrl+Shift+Z)".into();
+        }
+    }
+
+    /// Tap tempo: среднее последних ≤4 интервалов.
+    fn tap(&mut self) {
+        let now = Instant::now();
+        if let Some(last) = self.tap_times.last() {
+            if now.duration_since(*last).as_secs_f32() > 2.0 {
+                self.tap_times.clear();
+            }
+        }
+        self.tap_times.push(now);
+        if self.tap_times.len() >= 2 {
+            let t = &self.tap_times;
+            let sum: f32 = t.windows(2).map(|w| w[1].duration_since(w[0]).as_secs_f32()).sum();
+            let avg = sum / (t.len() - 1) as f32;
+            let bpm = (60.0 / avg).clamp(10.0, 522.0);
+            self.bpm = bpm as f64;
+            self.engine.set_bpm(bpm as f64);
+            self.hint = format!("Tap tempo: {bpm:.1} BPM");
+        } else {
+            self.hint = "Tap tempo: продолжай нажимать в ритм…".into();
         }
     }
 
@@ -445,12 +714,18 @@ impl eframe::App for App {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
+
+        // Транспорт — источник истины теперь движок: позиция читается атомарно.
+        let eng_playing = self.engine.playing();
+        if eng_playing {
+            self.playing = true;
+            self.pos_ticks = self.engine.position();
+        } else if self.playing {
+            // движок сам остановился (сброс после Stop) — синхронизируем UI
+            self.playing = false;
+            self.pos_ticks = 0.0;
+        }
         if self.playing {
-            self.pos_ticks += (self.bpm as f32 / 60.0) * PPQ * dt;
-            let loop_len = self.loop_ticks();
-            if self.pos_ticks >= loop_len {
-                self.pos_ticks %= loop_len;
-            }
             self.phase += dt * 9.0;
             for (i, s) in self.strips.iter_mut().enumerate() {
                 let base = if s.solo { 0.0 } else { s.vol };
@@ -473,24 +748,52 @@ impl eframe::App for App {
         ctx.input(|i| {
             let cmd = i.modifiers.command;
             if i.key_pressed(Key::Space) {
-                self.playing = !self.playing;
+                if self.engine.playing() {
+                    self.engine.stop();
+                } else {
+                    let (events, loop_ticks) = self.build_events();
+                    self.engine.play(events, loop_ticks);
+                    self.hint = if self.pattern_mode {
+                        "PAT: играет текущий паттерн (цикл)".into()
+                    } else {
+                        "SONG: играет аранжировка клипов".into()
+                    };
+                }
             }
             if i.key_pressed(Key::L) {
                 self.pattern_mode = !self.pattern_mode;
+                // перезапуск в новом режиме, если играет
+                if self.engine.playing() {
+                    let (events, loop_ticks) = self.build_events();
+                    self.engine.play(events, loop_ticks);
+                }
             }
             if i.key_pressed(Key::R) && !cmd {
                 self.recording = !self.recording;
                 self.hint = "Record toggle (R) — заглушка: записи нет".into();
             }
             if i.key_pressed(Key::H) && cmd {
+                self.engine.stop();
                 self.playing = false;
                 self.pos_ticks = 0.0;
-                self.hint = "Panic (Ctrl+H) — стоп, звук не реализован".into();
+                self.hint = "Panic (Ctrl+H) — стоп".into();
             }
             if i.key_pressed(Key::M) && cmd {
                 self.metronome = !self.metronome;
             }
+            if i.key_pressed(Key::Z) && cmd && !i.modifiers.shift {
+                self.undo();
+            }
+            if (i.key_pressed(Key::Z) && cmd && i.modifiers.shift)
+                || (i.key_pressed(Key::Y) && cmd)
+            {
+                self.redo();
+            }
+            if i.key_pressed(Key::T) && cmd {
+                self.show_piano = !self.show_piano;
+            }
             if i.key_pressed(Key::Home) {
+                self.engine.seek(0.0);
                 self.pos_ticks = 0.0;
                 self.hint = "Home — playhead в начало".into();
             }
@@ -546,13 +849,7 @@ impl eframe::App for App {
                 self.hint = "Save (Ctrl+S) — заглушка: собственный формат проекта не реализован".into();
             }
             if i.key_pressed(Key::O) && cmd {
-                self.hint = "Open (Ctrl+O) — заглушка: диалог открытия не реализован".into();
-            }
-            if i.key_pressed(Key::Z) && cmd {
-                self.hint = "Undo (Ctrl+Z) — заглушка: undo-стек не реализован".into();
-            }
-            if i.key_pressed(Key::T) && cmd {
-                self.hint = "Typing keyboard to piano (Ctrl+T) — заглушка".into();
+                self.open_flp_dialog();
             }
         });
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -579,6 +876,9 @@ impl eframe::App for App {
         }
         if self.show_picker {
             self.plugin_picker(ctx);
+        }
+        if self.show_piano {
+            self.typing_piano_window(ctx);
         }
     }
 }
@@ -625,9 +925,29 @@ impl App {
             ui.vertical(|ui| {
                 // ===== РЯД 1 =====
                 ui.horizontal(|ui| {
+                    // FILE: рабочие пункты + заглушки
+                    ui.menu_button("FILE", |ui| {
+                        if ui.button("New — пустой проект").clicked() {
+                            self.reload_from_project(Self::default_project());
+                            self.hint = "Новый проект (Sampler, 120 BPM)".into();
+                            ui.close_menu();
+                        }
+                        if ui.button("Open… (Ctrl+O)").clicked() {
+                            self.open_flp_dialog();
+                            ui.close_menu();
+                        }
+                        if ui.button("Export → WAV…").clicked() {
+                            self.export_wav_dialog();
+                            ui.close_menu();
+                        }
+                        for it in ["Save (Ctrl+S)", "Save as…", "Import", "Export → MP3/MIDI"] {
+                            if ui.button(it).clicked() {
+                                self.hint = format!("«{it}» — заглушка");
+                            }
+                        }
+                    });
                     for (name, items) in [
-                        ("FILE", vec!["New", "Open… (Ctrl+O)", "Save (Ctrl+S)", "Save as…", "Import", "Export → WAV/MP3/MIDI", "Exit"]),
-                        ("EDIT", vec!["Undo (Ctrl+Z) — заглушка", "Redo", "Cut", "Copy", "Paste"]),
+                        ("EDIT", vec!["Undo (Ctrl+Z)", "Redo (Ctrl+Shift+Z)", "Cut", "Copy", "Paste"]),
                         ("ADD", vec!["Channel — заглушка", "Effect — заглушка", "More plugins… (F8)", "Pattern"]),
                         ("PATTERNS", vec!["Rename (F2)", "Clone (Alt+C)", "Delete", "Find next empty (F4)", "Render as audio clip"]),
                         ("VIEW", vec!["Playlist (F5)", "Channel Rack (F6)", "Piano Roll (F7)", "Mixer (F9)", "Browser"]),
@@ -697,14 +1017,20 @@ impl App {
                     };
                     self.set_hint(
                         &play,
-                        "Play/Pause — Space (звук — заглушка, движется только курсор)",
+                        "Play/Pause — Space (движок cpal: играет паттерн/аранжировку)",
                     );
                     if play.clicked() {
-                        self.playing = !self.playing;
+                        if self.engine.playing() {
+                            self.engine.stop();
+                        } else {
+                            let (events, loop_ticks) = self.build_events();
+                            self.engine.play(events, loop_ticks);
+                        }
                     }
                     let stop = ui.add(egui::Button::new(egui::RichText::new("■").size(13.0)));
                     self.set_hint(&stop, "Stop — возврат в начало");
                     if stop.clicked() {
+                        self.engine.stop();
                         self.playing = false;
                         self.pos_ticks = 0.0;
                     }
@@ -719,13 +1045,24 @@ impl App {
                     }
 
                     // Tempo LCD — 3 знака после запятой, как в FL (130.000)
-                    ui.add(
+                    let bpm_r = ui.add(
                         egui::DragValue::new(&mut self.bpm)
                             .range(10.0..=522.0)
                             .speed(0.01)
                             .custom_formatter(|v, _| format!("{v:.3}")),
                     )
                     .on_hover_text("Темп 10–522 BPM; в FL точность 1/1000 BPM (правый клик — Tap/Half speed)");
+                    if bpm_r.drag_started() {
+                        self.push_undo();
+                    }
+                    if bpm_r.changed() {
+                        self.engine.set_bpm(self.bpm);
+                    }
+                    let tap = ui.add(egui::Button::new(egui::RichText::new("TAP").size(10.0)));
+                    self.set_hint(&tap, "Tap tempo: нажимай в ритм (пауза > 2 c сбрасывает)");
+                    if tap.clicked() {
+                        self.tap();
+                    }
                     ui.separator();
 
                     // метроном: индикатор мигает на сильную долю при игре
@@ -882,6 +1219,19 @@ impl App {
                     // Ряд инструментов с иконками FL (interface-map §4.3/§5.2):
                     // Draw/Draw(B)/Delete/Mute/Slice/Select/Zoom/Playback
                     self.tool_buttons(ui);
+                    ui.separator();
+
+                    // Undo/Redo (снапшоты нот/шагов/клипов/темпа)
+                    let u = ui.add(egui::Button::new(egui::RichText::new("↶").size(14.0)));
+                    self.set_hint(&u, "Undo (Ctrl+Z)");
+                    if u.clicked() {
+                        self.undo();
+                    }
+                    let r = ui.add(egui::Button::new(egui::RichText::new("↷").size(14.0)));
+                    self.set_hint(&r, "Redo (Ctrl+Shift+Z)");
+                    if r.clicked() {
+                        self.redo();
+                    }
                     ui.separator();
 
                     // окна справа (+ мастер-громкость — большая ручка FL справа ряда 2)
@@ -1121,12 +1471,22 @@ impl App {
                 );
                 self.set_hint(
                     &resp,
-                    "Step Sequencer: ЛКМ — включить шаг (нота 1/16, key 63), ПКМ — выключить. Заглушка: в память, без звука",
+                    "Step Sequencer: ЛКМ — включить шаг (нота 1/16 + превью звука), ПКМ — выключить",
                 );
                 if resp.clicked() && !orig {
+                    self.push_undo();
                     self.user_steps.insert((iid, step));
+                    // превью: sampler-каналы — кик, прочие — тон C4
+                    let (key, src) = if self.src_for_channel(iid) == VoiceSrc::Kick {
+                        (60, VoiceSrc::Kick)
+                    } else {
+                        (60, VoiceSrc::Tone)
+                    };
+                    self.engine
+                        .preview(key, 100, 0.3, self.gain_for_channel(iid), src);
                 }
                 if resp.secondary_clicked() && user {
+                    self.push_undo();
                     self.user_steps.remove(&(iid, step));
                 }
             }
@@ -1452,9 +1812,11 @@ impl App {
                             let bar = (((pos.x - origin.x) / bar_w) as usize).min(SONG_BARS - 1);
                             let tr = (((pos.y - origin.y) / ROW_H) as usize).min(VISIBLE_TRACKS - 1);
                             if self.tool == Tool::Draw && resp.clicked() && !self.demo_clips.contains(&(tr, bar)) {
+                                self.push_undo();
                                 self.demo_clips.push((tr, bar));
-                                self.hint = "Клип-заглушка добавлен (в памяти; настоящий клип появится вместе с writer'ом)".into();
+                                self.hint = "Клип добавлен (участвует в SONG-воспроизведении и экспорте)".into();
                             } else if self.tool == Tool::Delete && resp.clicked() {
+                                self.push_undo();
                                 self.demo_clips.retain(|c| c != &(tr, bar));
                             }
                             if pos.y < origin.y && resp.clicked() {
@@ -1629,6 +1991,7 @@ impl App {
                                     && n.key == key
                             });
                             if let Some(i) = hit {
+                                self.push_undo();
                                 self.notes.remove(i);
                                 if self.selected_note == Some(i) {
                                     self.selected_note = None;
@@ -1657,6 +2020,7 @@ impl App {
                             }
                             match hit {
                                 Some(i) => {
+                                    self.push_undo();
                                     self.selected_note = Some(i);
                                     if edge {
                                         self.roll_drag = Some(RollDrag::Resize { idx: i });
@@ -1670,10 +2034,11 @@ impl App {
                                     }
                                 }
                                 None => {
-                                    // новая нота: pos/key под курсором, длина последней
+                                    // новая нота: pos/key под курсором, длина последней + звук
                                     let pos_t =
                                         ((tick_f / snap_t).floor() * snap_t) as u32;
                                     let iid = self.active_channel as u16;
+                                    self.push_undo();
                                     self.notes.push(UiNote {
                                         iid,
                                         pos: pos_t.min(383),
@@ -1682,13 +2047,20 @@ impl App {
                                         vel: 100,
                                     });
                                     self.selected_note = Some(self.notes.len() - 1);
+                                    self.engine.preview(
+                                        key_under,
+                                        100,
+                                        self.last_note_len as f32 * self.secs_per_tick(),
+                                        self.gain_for_channel(iid),
+                                        self.src_for_channel(iid),
+                                    );
                                     self.roll_drag = Some(RollDrag::Move {
                                         idx: self.notes.len() - 1,
                                         dpos: 0,
                                         dkey: 0,
                                     });
                                     self.hint =
-                                        "Нота создана (drag — переместить, правый край — длина; в памяти, без звука)"
+                                        "Нота создана (drag — переместить, правый край — длина)"
                                             .into();
                                 }
                             }
@@ -1733,6 +2105,7 @@ impl App {
                 if ui.input(|i| i.key_pressed(Key::Delete)) {
                     if let Some(i) = self.selected_note {
                         if i < self.notes.len() {
+                            self.push_undo();
                             self.notes.remove(i);
                         }
                         self.selected_note = None;
@@ -1811,6 +2184,7 @@ impl App {
                             ui.add(egui::DragValue::new(&mut n.key).prefix("key ").range(0..=127));
                             ui.add(egui::DragValue::new(&mut n.vel).prefix("vel ").range(0..=127));
                             if ui.button("удалить").clicked() {
+                                self.push_undo();
                                 self.notes.remove(i);
                                 self.selected_note = None;
                             }
@@ -1821,6 +2195,67 @@ impl App {
                 });
             });
         self.show_roll = open;
+    }
+
+    // ---------- Typing keyboard to piano (Ctrl+T, behavior-catalog §2) ----------
+    fn typing_piano_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_piano;
+        egui::Window::new("🎹 Typing keyboard to piano — Ctrl+T")
+            .open(&mut open)
+            .default_pos([560.0, 420.0])
+            .default_size([520.0, 140.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Клавиши A S D F G H J K = ноты от C{} · целевой канал: {}",
+                        4,
+                        self.channel_name(self.active_channel as u16)
+                    ))
+                    .weak()
+                    .small(),
+                );
+                // 8 «клавиш»-кнопок; клик или нажатие — нота
+                let keys = [
+                    (Key::A, 60usize, "A"),
+                    (Key::S, 62, "S"),
+                    (Key::D, 64, "D"),
+                    (Key::F, 65, "F"),
+                    (Key::G, 67, "G"),
+                    (Key::H, 69, "H"),
+                    (Key::J, 71, "J"),
+                    (Key::K, 72, "K"),
+                ];
+                ui.horizontal(|ui| {
+                    let mut hit: Option<usize> = None;
+                    for (i, (k, _, label)) in keys.iter().enumerate() {
+                        let pressed = ui.input(|i| i.key_pressed(*k));
+                        if pressed {
+                            hit = Some(i);
+                        }
+                        if ui.add(
+                            egui::Button::new(egui::RichText::new(*label).size(14.0))
+                                .min_size(egui::vec2(48.0, 52.0))
+                                .fill(if pressed { C_ACCENT } else { C_PANEL_DARK }),
+                        )
+                        .clicked()
+                        {
+                            hit = Some(i);
+                        }
+                    }
+                    if let Some(i) = hit {
+                        let (_, key, _) = keys[i];
+                        let iid = self.active_channel as u16;
+                        self.engine.preview(
+                            key as u16,
+                            100,
+                            0.4,
+                            self.gain_for_channel(iid),
+                            self.src_for_channel(iid),
+                        );
+                    }
+                });
+            });
+        self.show_piano = open;
     }
 
     // ---------- Plugin Picker (F8, interface-map §9) ----------

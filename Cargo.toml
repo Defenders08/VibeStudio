@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/flp_compat", "apps/proto-ui"]
+members = ["crates/flp_compat", "crates/vibe_engine", "apps/proto-ui"]
 
 [workspace.package]
 version = "0.1.0"

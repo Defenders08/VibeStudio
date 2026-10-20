@@ -8,5 +8,7 @@ description = "Рабочий прототип FL-подобного интер�
 [dependencies]
 eframe = "0.31"
 flp_compat = { path = "../../crates/flp_compat" }
+vibe_engine = { path = "../../crates/vibe_engine" }
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.15"
