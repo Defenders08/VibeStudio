@@ -92,6 +92,16 @@ fn setup_style(ctx: &egui::Context) {
 enum Tool {
     Draw,
     Delete,
+    Select,
+    Mute,
+}
+
+/// Контекстное меню (правая кнопка): позиция + цель.
+#[derive(Clone, Copy, PartialEq)]
+enum CtxTarget {
+    Clip { track: u32, bar: u32 },
+    Channel { id: u32 },
+    PlaylistEmpty { track: u32, bar: u32 },
 }
 
 #[derive(Clone, Copy)]
@@ -130,8 +140,13 @@ struct App {
     snap: usize,
     // ui-прочее
     playlist_zoom: f32,
-    muted_tracks: HashSet<usize>,
+    /// Выделение клипов (track, bar) — инструмент Select.
+    selection: HashSet<(u32, u32)>,
+    /// Прямоугольник выделения (пиксели, экран-координаты сетки).
+    select_rect: Option<(egui::Pos2, egui::Pos2)>,
     confirm_delete_channel: Option<u32>,
+    ctx_menu: Option<(egui::Pos2, CtxTarget)>,
+    ctx_menu_rect: Option<egui::Rect>,
     tap_times: Vec<Instant>,
     icons: HashMap<&'static str, egui::TextureHandle>,
     current_file: Option<String>,
@@ -178,8 +193,11 @@ impl App {
             tool: Tool::Draw,
             snap: 1,
             playlist_zoom: 1.0,
-            muted_tracks: HashSet::new(),
+            selection: HashSet::new(),
+            select_rect: None,
             confirm_delete_channel: None,
+            ctx_menu: None,
+            ctx_menu_rect: None,
             tap_times: Vec::new(),
             icons,
             current_file: None,
@@ -634,6 +652,7 @@ impl eframe::App for App {
             self.typing_piano_window(ctx);
         }
         self.confirm_delete_window(ctx);
+        self.context_menu_window(ctx);
     }
 }
 
@@ -890,25 +909,38 @@ impl App {
     }
 
     fn tool_buttons(&mut self, ui: &mut egui::Ui) {
-        let entries: [(&str, &str, bool); 4] = [
-            ("draw", "Draw (P): ЛКМ — поставить, ПКМ — удалить; drag — переместить", self.tool == Tool::Draw),
-            ("delete", "Delete (D): стирать ноты/клипы", self.tool == Tool::Delete),
-            ("select", "Select (E) — заглушка, будет в следующей итерации", false),
-            ("playback", "Playback (Y) — заглушка, будет с транспорт-прыжком", false),
+        // Ряд как в FL: Draw / Delete / Select / Mute
+        let entries: [(&str, &str, bool, bool); 4] = [
+            ("draw", "Draw (P): ЛКМ — поставить, drag — переместить/растянуть", self.tool == Tool::Draw, false),
+            ("delete", "Delete (D): стирать клипы/ноты", self.tool == Tool::Delete, false),
+            ("select", "Select (E): рамка — выделить клипы; Del — удалить выделенные; drag выделенного — двигать группу", self.tool == Tool::Select, false),
+            ("mute", "Mute (T): клик по клипу — приглушить (слышно в SONG)", self.tool == Tool::Mute, false),
         ];
-        for (icon, tip, active) in entries {
+        for (icon, tip, active, _stub) in entries {
             let mut r = icon_button(ui, &self.icons, icon, 17.0, tip);
             if active {
                 ui.painter().rect_filled(r.rect.expand(2.0), 2.0, C_ACCENT.gamma_multiply(0.35));
                 r.mark_changed();
             }
             if r.clicked() {
-                match icon {
-                    "draw" => self.tool = Tool::Draw,
-                    "delete" => self.tool = Tool::Delete,
-                    other => self.hint = format!("«{other}» — заглушка"),
-                }
+                self.tool = match icon {
+                    "draw" => Tool::Draw,
+                    "delete" => Tool::Delete,
+                    "select" => Tool::Select,
+                    _ => Tool::Mute,
+                };
             }
+        }
+    }
+
+    /// Кнопка/пункт, функционал которого не реализован: запрещающий курсор.
+    fn stub_item(&mut self, ui: &mut egui::Ui, label: &str) {
+        let r = ui.button(label).on_hover_cursor(egui::CursorIcon::NotAllowed);
+        if r.hovered() {
+            self.hint = format!("«{label}» — не реализовано в прототипе");
+        }
+        if r.clicked() {
+            self.hint = format!("«{label}» — не реализовано (заглушка)");
         }
     }
 
@@ -1020,12 +1052,12 @@ impl App {
                     [brect.left_top() + egui::vec2(1.0, 1.0), brect.right_top() + egui::vec2(-1.0, 1.0)],
                     egui::Stroke::new(1.0_f32, C_BTN_HI),
                 );
-                self.set_hint(&btn, "ЛКМ — выбрать канал (Target Piano Roll); ПКМ — меню с удалением");
+                self.set_hint(&btn, "ЛКМ — выбрать канал (Target Piano Roll); ПКМ — меню канала");
                 if btn.clicked() {
                     self.active_channel = ch.id;
                 }
                 if btn.secondary_clicked() {
-                    self.confirm_delete_channel = Some(ch.id);
+                    self.ctx_menu = Some((btn.interact_pointer_pos().unwrap_or(brect.center()), CtxTarget::Channel { id: ch.id }));
                 }
             });
             ui.allocate_ui_with_layout(egui::vec2(9.0, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -1270,13 +1302,13 @@ impl App {
                             painter.rect_filled(head, 2.0, TRACK_GROUP_COLORS[(tr / 4) % 4]);
                             painter.text(egui::pos2(resp.rect.left() + 6.0, y + ROW_H / 2.0), Align2::LEFT_CENTER, format!("Track {}", tr + 1), egui::FontId::proportional(12.5), Color32::WHITE);
                             let led_c = egui::pos2(resp.rect.left() + track_col_w - 4.0, y + ROW_H / 2.0);
-                            let muted = self.muted_tracks.contains(&tr);
+                            let muted = m.muted_tracks.contains(&(tr as u32));
                             painter.circle_filled(led_c, 3.0, if muted { C_LED_OFF } else { C_PLAY });
                             let led_rect = egui::Rect::from_center_size(led_c, egui::vec2(12.0, ROW_H));
                             let led_resp = ui.interact(led_rect, egui::Id::new(("trled", tr)), Sense::click());
-                            self.set_hint(&led_resp, "Mute LED трека");
+                            self.set_hint(&led_resp, "Mute LED трека: глушит все клипы дорожки (SONG)");
                             if led_resp.clicked() {
-                                if muted { self.muted_tracks.remove(&tr); } else { self.muted_tracks.insert(tr); }
+                                self.engine.execute(Command::SetTrackMute { track: tr as u32, muted: !muted });
                             }
                             painter.rect_filled(egui::Rect::from_min_size(egui::pos2(origin.x, y), egui::vec2(grid_w, ROW_H - 2.0)), 0.0, Color32::from_rgb(0x26, 0x28, 0x2B));
                         }
@@ -1291,41 +1323,81 @@ impl App {
                             if (c.track as usize) >= VISIBLE_TRACKS {
                                 continue;
                             }
-                            let dim = self.muted_tracks.contains(&(c.track as usize));
+                            let dim = c.muted || m.muted_tracks.contains(&c.track);
+                            let selected = self.selection.contains(&(c.track, c.bar));
                             let r = egui::Rect::from_min_size(
                                 egui::pos2(origin.x + c.bar as f32 * bar_w + 1.0, origin.y + c.track as f32 * ROW_H + 1.0),
                                 egui::vec2(c.len_bars as f32 * bar_w - 2.0, ROW_H - 4.0),
                             );
                             let col = self.pattern_color(&m, c.pattern_id);
-                            painter.rect_filled(r, 3.0, if dim { col.gamma_multiply(0.4) } else { col });
+                            painter.rect_filled(r, 3.0, if dim { col.gamma_multiply(0.35) } else { col });
+                            if selected {
+                                painter.rect_stroke(r, 3.0, egui::Stroke::new(2.0, Color32::WHITE), egui::StrokeKind::Inside);
+                            }
                             let pname = m.patterns.iter().find(|p| p.id == c.pattern_id).map(|p| p.name.clone()).unwrap_or_default();
-                            painter.text(egui::pos2(r.left() + 4.0, r.center().y), Align2::LEFT_CENTER, pname, egui::FontId::proportional(11.5), Color32::WHITE);
+                            painter.text(egui::pos2(r.left() + 4.0, r.center().y), Align2::LEFT_CENTER, if c.muted { format!("🔉 {pname}") } else { pname }, egui::FontId::proportional(11.5), Color32::WHITE);
                             let clip_resp = ui.interact(r, egui::Id::new(("clip", i)), Sense::click_and_drag());
-                            self.set_hint(&clip_resp, "Клип: drag — переместить, правый край — растянуть, ПКМ — удалить");
-                            // drag: перемещение между тактами/дорожками
-                            if clip_resp.dragged() && self.tool == Tool::Draw {
-                                if let Some(p) = clip_resp.interact_pointer_pos() {
-                                    let nb = (((p.x - origin.x) / bar_w) as u32).min((SONG_BARS - 1) as u32);
-                                    let nt = (((p.y - origin.y) / ROW_H) as u32).min((VISIBLE_TRACKS - 1) as u32);
-                                    if nb != c.bar || nt != c.track {
-                                        self.engine.execute(Command::MoveClip { track: c.track, bar: c.bar, new_track: nt, new_bar: nb });
-                                    }
-                                }
-                            }
-                            // resize за правый край
-                            let edge = egui::Rect::from_min_size(r.right_center() - egui::vec2(6.0, ROW_H / 2.0), egui::vec2(8.0, ROW_H));
-                            let edge_resp = ui.interact(edge, egui::Id::new(("clipedge", i)), Sense::drag());
-                            self.set_hint(&edge_resp, "Растянуть клип за правый край");
-                            if edge_resp.dragged() {
-                                if let Some(p) = edge_resp.interact_pointer_pos() {
-                                    let nb = (((p.x - origin.x) / bar_w) as u32) + 1;
-                                    if nb != c.len_bars {
-                                        self.engine.execute(Command::ResizeClip { track: c.track, bar: c.bar, new_len_bars: nb.max(1) });
-                                    }
-                                }
-                            }
+                            self.set_hint(&clip_resp, "Клип: drag — переместить, правый край — растянуть, ПКМ — меню");
                             if clip_resp.secondary_clicked() {
-                                self.engine.execute(Command::RemoveClip { track: c.track, bar: c.bar });
+                                self.ctx_menu = Some((clip_resp.interact_pointer_pos().unwrap_or(r.center()), CtxTarget::Clip { track: c.track, bar: c.bar }));
+                                break;
+                            }
+                            match self.tool {
+                                Tool::Draw => {
+                                    // drag выбранного клипа двигает всю группу выделения
+                                    if clip_resp.drag_started() && selected && self.selection.len() > 1 {
+                                        self.hint = format!("Перетаскивание группы: {} клипов", self.selection.len());
+                                    }
+                                    if clip_resp.dragged() {
+                                        if let Some(p) = clip_resp.interact_pointer_pos() {
+                                            let nb = (((p.x - origin.x) / bar_w) as u32).min((SONG_BARS - 1) as u32);
+                                            let nt = (((p.y - origin.y) / ROW_H) as u32).min((VISIBLE_TRACKS - 1) as u32);
+                                            if nb != c.bar || nt != c.track {
+                                                let group: Vec<(u32, u32)> = if selected && self.selection.len() > 1 {
+                                                    self.selection.iter().copied().collect()
+                                                } else {
+                                                    vec![(c.track, c.bar)]
+                                                };
+                                                let d_bar = nb as i64 - c.bar as i64;
+                                                let d_tr = nt as i64 - c.track as i64;
+                                                for (t0, b0) in group {
+                                                    let nt2 = ((t0 as i64 + d_tr).max(0)) as u32;
+                                                    let nb2 = ((b0 as i64 + d_bar).max(0)) as u32;
+                                                    if (nt2, nb2) != (t0, b0) {
+                                                        self.engine.execute(Command::MoveClip { track: t0, bar: b0, new_track: nt2, new_bar: nb2 });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // resize за правый край
+                                    let edge = egui::Rect::from_min_size(r.right_center() - egui::vec2(6.0, ROW_H / 2.0), egui::vec2(8.0, ROW_H));
+                                    let edge_resp = ui.interact(edge, egui::Id::new(("clipedge", i)), Sense::drag());
+                                    self.set_hint(&edge_resp, "Растянуть клип за правый край");
+                                    if edge_resp.dragged() {
+                                        if let Some(p) = edge_resp.interact_pointer_pos() {
+                                            let nb = (((p.x - origin.x) / bar_w) as u32) + 1;
+                                            if nb != c.len_bars {
+                                                self.engine.execute(Command::ResizeClip { track: c.track, bar: c.bar, new_len_bars: nb.max(1) });
+                                            }
+                                        }
+                                    }
+                                }
+                                Tool::Delete => {
+                                    if clip_resp.clicked() {
+                                        self.engine.execute(Command::RemoveClip { track: c.track, bar: c.bar });
+                                    }
+                                }
+                                Tool::Select => {
+                                    if clip_resp.clicked() {
+                                        self.selection.insert((c.track, c.bar));
+                                    }
+                                }
+                                Tool::Mute => {
+                                    if clip_resp.clicked() {
+                                        self.engine.execute(Command::SetClipMute { track: c.track, bar: c.bar, muted: !c.muted });
+                                    }
+                                }
                             }
                         }
                         // playhead
@@ -1333,6 +1405,62 @@ impl App {
                             let x = origin.x + (self.pos_ticks as f32 / (SONG_BARS as f32 * 384.0)) * grid_w;
                             painter.line_segment([egui::pos2(x, origin.y), egui::pos2(x, origin.y + grid_h)], egui::Stroke::new(1.5_f32, C_PLAY));
                         }
+                        // SELECT-рамка: drag по сетке рисует прямоугольник выделения
+                        if self.tool == Tool::Select {
+                            if resp.drag_started() {
+                                self.select_rect = resp.interact_pointer_pos().map(|p| (p, p));
+                                self.selection.clear();
+                            }
+                            if resp.dragged() {
+                                if let (Some((_, _)), Some(p)) = (self.select_rect, resp.interact_pointer_pos()) {
+                                    if let Some((_, _)) = self.select_rect.as_mut() {
+                                        self.select_rect = Some((self.select_rect.unwrap().0, p));
+                                    }
+                                }
+                            }
+                            if let Some((a, b)) = self.select_rect {
+                                let rect = egui::Rect::from_two_pos(a, b);
+                                painter.rect_filled(rect, 1.0, C_ACCENT.gamma_multiply(0.15));
+                                painter.rect_stroke(rect, 1.0, egui::Stroke::new(1.5, C_ACCENT), egui::StrokeKind::Inside);
+                            }
+                            if resp.drag_stopped() {
+                                if let Some((a, b)) = self.select_rect {
+                                    let sel = egui::Rect::from_two_pos(a, b);
+                                    let m = self.engine.model_snapshot();
+                                    for c in &m.clips {
+                                        if (c.track as usize) >= VISIBLE_TRACKS {
+                                            continue;
+                                        }
+                                        let cr = egui::Rect::from_min_size(
+                                            egui::pos2(origin.x + c.bar as f32 * bar_w, origin.y + c.track as f32 * ROW_H),
+                                            egui::vec2(c.len_bars as f32 * bar_w, ROW_H),
+                                        );
+                                        if sel.intersects(cr) {
+                                            self.selection.insert((c.track, c.bar));
+                                        }
+                                    }
+                                    if self.selection.is_empty() {
+                                        self.hint = "Выделение пустое".into();
+                                    } else {
+                                        self.hint = format!("Выделено клипов: {} (Del — удалить, drag — переместить)", self.selection.len());
+                                    }
+                                }
+                                self.select_rect = None;
+                            }
+                        } else {
+                            self.select_rect = None;
+                        }
+                        // Del — удалить выделенные
+                        if self.tool == Tool::Select
+                            && ui.input(|i| i.key_pressed(egui::Key::Delete))
+                            && !self.selection.is_empty()
+                        {
+                            for (tr, bar) in self.selection.drain() {
+                                self.engine.execute(Command::RemoveClip { track: tr, bar });
+                            }
+                            self.hint = "Выделенные клипы удалены".into();
+                        }
+
                         // сетка: draw/delete/seek
                         if let Some(pos) = resp.interact_pointer_pos() {
                             if pos.x >= origin.x && pos.y >= origin.y {
@@ -1342,26 +1470,34 @@ impl App {
                                 if pos.y < origin.y && resp.clicked() {
                                     self.pos_ticks = bar as f64 * 384.0;
                                     self.engine.execute(Command::Seek { tick: self.pos_ticks as f32 });
-                                } else if pos.y >= origin.y && resp.clicked() {
-                                    if self.tool == Tool::Draw {
-                                        let snapped_bar = match self.snap {
-                                            0 | 1 | 2 | 3 | 4 | 5 => bar,
-                                            6 => bar,
-                                            _ => bar,
-                                        };
-                                        let m = self.engine.model_snapshot();
-                                        let pid = m.patterns.get(self.current_pattern).map(|p| p.id).unwrap_or(1);
-                                        if !m.clips.iter().any(|c| c.track as usize == tr && c.bar == snapped_bar) {
-                                            self.engine.execute(Command::AddClip { track: tr as u32, bar: snapped_bar, len_bars: 1, pattern_id: pid });
-                                            self.hint = "Клип добавлен (играет в SONG)".into();
+                                } else if pos.y >= origin.y {
+                                    if resp.secondary_clicked() {
+                                        self.ctx_menu = Some((pos, CtxTarget::PlaylistEmpty { track: tr as u32, bar }));
+                                    } else if resp.clicked() {
+                                    match self.tool {
+                                        Tool::Draw => {
+                                            let m = self.engine.model_snapshot();
+                                            let pid = m.patterns.get(self.current_pattern).map(|p| p.id).unwrap_or(1);
+                                            if !m.clips.iter().any(|c| c.track as usize == tr && c.bar == bar) {
+                                                self.engine.execute(Command::AddClip { track: tr as u32, bar, len_bars: 1, pattern_id: pid });
+                                                self.hint = "Клип добавлен (играет в SONG)".into();
+                                            }
                                         }
-                                    } else if self.tool == Tool::Delete {
-                                        let m = self.engine.model_snapshot();
-                                        if let Some(c) = m.clips.iter().find(|c| c.track as usize == tr && c.bar == bar).cloned() {
-                                            self.engine.execute(Command::RemoveClip { track: c.track, bar: c.bar });
+                                        Tool::Delete => {
+                                            let m = self.engine.model_snapshot();
+                                            if let Some(c) = m.clips.iter().find(|c| c.track as usize == tr && c.bar == bar).cloned() {
+                                                self.engine.execute(Command::RemoveClip { track: c.track, bar: c.bar });
+                                            }
+                                        }
+                                        Tool::Select => {
+                                            self.selection.clear();
+                                        }
+                                        Tool::Mute => {
+                                            self.hint = "Mute: кликайте по клипам (не по пустому месту)".into();
                                         }
                                     }
                                 }
+                            }
                             }
                         }
                     });
@@ -1715,6 +1851,150 @@ impl App {
                 });
             });
         self.show_piano = open;
+    }
+
+    /// Контекстное меню правой кнопки (как в FL): позиция у курсора,
+    /// закрывается кликом вне; пункты-заглушки — с запрещающим курсором.
+    fn context_menu_window(&mut self, ctx: &egui::Context) {
+        let Some((pos, target)) = self.ctx_menu else { return };
+        let mut keep_open = true;
+        let mut rect_out = None;
+        egui::Area::new(egui::Id::new("ctx_menu"))
+            .fixed_pos(pos)
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(190.0);
+                    match target {
+                        CtxTarget::Clip { track, bar } => {
+                            let m = self.engine.model_snapshot();
+                            let pid = m
+                                .clips
+                                .iter()
+                                .find(|c| c.track == track && c.bar == bar)
+                                .map(|c| c.pattern_id);
+                            let pname = pid
+                                .and_then(|id| {
+                                    m.patterns.iter().find(|p| p.id == id).map(|p| p.name.clone())
+                                })
+                                .unwrap_or_default();
+                            ui.label(egui::RichText::new(format!("Клип: {pname}")).weak().small());
+                            ui.separator();
+                            self.stub_item(ui, "Preview");
+                            self.stub_item(ui, "Rename / color…");
+                            self.stub_item(ui, "Make unique");
+                            if let Some(id) = pid {
+                                if ui.button("Select all similar").clicked() {
+                                    self.tool = Tool::Select;
+                                    self.selection = m
+                                        .clips
+                                        .iter()
+                                        .filter(|c| c.pattern_id == id)
+                                        .map(|c| (c.track, c.bar))
+                                        .collect();
+                                    self.hint =
+                                        format!("Выделено похожих клипов: {}", self.selection.len());
+                                    keep_open = false;
+                                }
+                            }
+                            ui.separator();
+                            let is_muted = m
+                                .clips
+                                .iter()
+                                .find(|c| c.track == track && c.bar == bar)
+                                .map(|c| c.muted)
+                                .unwrap_or(false);
+                            if ui
+                                .button(if is_muted { "🔊 Unmute" } else { "🔇 Mute" })
+                                .clicked()
+                            {
+                                self.engine
+                                    .execute(Command::SetClipMute { track, bar, muted: !is_muted });
+                                keep_open = false;
+                            }
+                            if ui
+                                .button(egui::RichText::new("🗑 Delete").color(C_REC))
+                                .clicked()
+                            {
+                                self.engine.execute(Command::RemoveClip { track, bar });
+                                self.selection.remove(&(track, bar));
+                                keep_open = false;
+                            }
+                        }
+                        CtxTarget::Channel { id } => {
+                            let name = self
+                                .engine
+                                .model_snapshot()
+                                .channels
+                                .iter()
+                                .find(|c| c.id == id)
+                                .map(|c| c.name.clone())
+                                .unwrap_or_default();
+                            ui.label(egui::RichText::new(format!("Канал: {name}")).weak().small());
+                            ui.separator();
+                            if ui.button("🎹 Piano roll").clicked() {
+                                self.active_channel = id;
+                                self.show_roll = true;
+                                keep_open = false;
+                            }
+                            self.stub_item(ui, "Rename / color / icon (F2)");
+                            self.stub_item(ui, "Load sample…");
+                            self.stub_item(ui, "Clone (Alt+C)");
+                            ui.separator();
+                            if ui
+                                .button(egui::RichText::new("🗑 Delete…").color(C_REC))
+                                .clicked()
+                            {
+                                self.confirm_delete_channel = Some(id);
+                                keep_open = false;
+                            }
+                        }
+                        CtxTarget::PlaylistEmpty { track, bar } => {
+                            ui.label(egui::RichText::new(format!(
+                                "Track {} · такт {}",
+                                track + 1,
+                                bar + 1
+                            ))
+                            .weak()
+                            .small());
+                            ui.separator();
+                            if ui.button("Insert pattern clip").clicked() {
+                                let m = self.engine.model_snapshot();
+                                let pid = m
+                                    .patterns
+                                    .get(self.current_pattern)
+                                    .map(|p| p.id)
+                                    .unwrap_or(1);
+                                self.engine.execute(Command::AddClip {
+                                    track,
+                                    bar,
+                                    len_bars: 1,
+                                    pattern_id: pid,
+                                });
+                                keep_open = false;
+                            }
+                            self.stub_item(ui, "Paste");
+                            self.stub_item(ui, "Insert time…");
+                        }
+                    }
+                });
+                rect_out = Some(ui.min_rect());
+            });
+        self.ctx_menu_rect = rect_out;
+        if keep_open {
+            let clicked = ctx.input(|i| i.pointer.primary_clicked());
+            let inside = ctx
+                .input(|i| i.pointer.interact_pos())
+                .zip(self.ctx_menu_rect)
+                .map(|(p, r)| r.contains(p))
+                .unwrap_or(false);
+            if clicked && !inside {
+                keep_open = false;
+            }
+        }
+        if !keep_open {
+            self.ctx_menu = None;
+        }
     }
 
     fn confirm_delete_window(&mut self, ctx: &egui::Context) {

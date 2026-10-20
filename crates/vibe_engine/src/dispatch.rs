@@ -157,6 +157,7 @@ pub fn dispatch(model: &mut ProjectModel, cmd: &Command) -> Option<Command> {
                 bar: *bar,
                 len_bars: (*len_bars).max(1),
                 pattern_id: *pattern_id,
+                muted: false,
             });
             Some(C::RemoveClip { track: *track, bar: *bar })
         }
@@ -177,6 +178,24 @@ pub fn dispatch(model: &mut ProjectModel, cmd: &Command) -> Option<Command> {
             let idx = model.clips.iter().position(|c| c.track == *track && c.bar == *bar)?;
             let c = model.clips.remove(idx);
             Some(C::AddClip { track: c.track, bar: c.bar, len_bars: c.len_bars, pattern_id: c.pattern_id })
+        }
+        C::SetClipMute { track, bar, muted } => {
+            let c = model.clips.iter_mut().find(|c| c.track == *track && c.bar == *bar)?;
+            let inv = C::SetClipMute { track: *track, bar: *bar, muted: c.muted };
+            c.muted = *muted;
+            Some(inv)
+        }
+        C::SetTrackMute { track, muted } => {
+            let cur = model.muted_tracks.contains(track);
+            let inv = C::SetTrackMute { track: *track, muted: cur };
+            if *muted {
+                if !cur {
+                    model.muted_tracks.push(*track);
+                }
+            } else {
+                model.muted_tracks.retain(|t| t != track);
+            }
+            Some(inv)
         }
         C::LoadProject { model: m } => {
             let inv = C::LoadProject { model: model.clone() };
@@ -243,6 +262,9 @@ pub fn build_events(
         }
         PlayMode::Song => {
             for c in &model.clips {
+                if c.muted || model.muted_tracks.contains(&c.track) {
+                    continue;
+                }
                 for b in 0..c.len_bars {
                     push_pattern(&mut ev, (c.bar + b) as f32 * TICKS_PER_BAR, c.pattern_id);
                 }

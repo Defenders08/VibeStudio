@@ -434,6 +434,8 @@ impl Engine {
                 | Command::MoveClip { .. }
                 | Command::ResizeClip { .. }
                 | Command::RemoveClip { .. }
+                | Command::SetClipMute { .. }
+                | Command::SetTrackMute { .. }
                 | Command::LoadProject { .. }
         );
         if is_model {

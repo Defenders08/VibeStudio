@@ -68,6 +68,8 @@ pub enum Command {
     MoveClip { track: u32, bar: u32, new_track: u32, new_bar: u32 },
     ResizeClip { track: u32, bar: u32, new_len_bars: u32 },
     RemoveClip { track: u32, bar: u32 },
+    SetClipMute { track: u32, bar: u32, muted: bool },
+    SetTrackMute { track: u32, muted: bool },
 
     // ---- файлы ----
     /// Загрузить модель целиком (Open / New); обратная команда вернёт старую.

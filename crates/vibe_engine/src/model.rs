@@ -67,6 +67,9 @@ pub struct Clip {
     /// Длина в тактах (пока всегда ≥1).
     pub len_bars: u32,
     pub pattern_id: u32,
+    /// Mute клипа (Mute-инструмент плейлиста).
+    #[serde(default)]
+    pub muted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +81,9 @@ pub struct ProjectModel {
     pub channels: Vec<Channel>,
     pub patterns: Vec<Pattern>,
     pub clips: Vec<Clip>,
+    /// Muted-дорожки плейлиста (LED трека).
+    #[serde(default)]
+    pub muted_tracks: Vec<u32>,
     /// Следующий свободный id (каналы и паттерны делят пространство).
     pub next_id: u32,
 }
@@ -105,6 +111,7 @@ impl Default for ProjectModel {
                 notes: Vec::new(),
             }],
             clips: Vec::new(),
+            muted_tracks: Vec::new(),
             next_id: 2,
         }
     }
