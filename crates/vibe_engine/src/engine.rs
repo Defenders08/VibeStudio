@@ -258,7 +258,8 @@ impl Engine {
         let mut state_sr = 44100.0f32;
         let mut stream = None;
         let mut silent = true;
-        let state = {
+        let state = Arc::new(Mutex::new(PlayState::new(state_sr)));
+        {
             let host = cpal::default_host();
             match (|| -> Result<cpal::Stream, Box<dyn std::error::Error>> {
                 let device = host
@@ -266,11 +267,11 @@ impl Engine {
                     .ok_or("нет output-устройства")?;
                 let cfg = device.default_output_config()?;
                 let sr = cfg.sample_rate().0 as f32;
-                state_sr = sr;
-                let st = Arc::new(Mutex::new(PlayState::new(sr)));
+                // единый PlayState: колбэк и Engine.state делят один Arc
+                state.lock().unwrap().sample_rate = sr;
                 let status = status_bits.clone();
                 let pos = pos_bits.clone();
-                let stc = st.clone();
+                let stc = state.clone();
                 let err_cb = |e| eprintln!("[vibe_engine] stream error: {e}");
                 let data_cb = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut st = match stc.try_lock() {
@@ -300,11 +301,9 @@ impl Engine {
                 Ok(s) => {
                     silent = false;
                     stream = Some(s);
-                    Arc::new(Mutex::new(PlayState::new(state_sr)))
                 }
                 Err(e) => {
                     eprintln!("[vibe_engine] звук недоступен ({e}); offline-рендер работает");
-                    Arc::new(Mutex::new(PlayState::new(state_sr)))
                 }
             }
         };

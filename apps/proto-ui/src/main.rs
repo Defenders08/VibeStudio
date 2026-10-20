@@ -940,7 +940,13 @@ impl eframe::App for App {
                 self.open_flp_dialog();
             }
         });
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        // Позиция течёт только при Playing — просим кадр каждые 8 мс,
+        // иначе 30 мс (энергосбережение без потери плавности LCD).
+        if self.playing_status == TransportStatus::Playing {
+            ctx.request_repaint_after(std::time::Duration::from_millis(8));
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        }
 
         // Порядок панелей = FL: тулбар сверху, Channel Rack прикован под ним,
         // Browser слева, снизу статусная строка; центр — рабочий стол с плавающими окнами.
