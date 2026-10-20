@@ -1,0 +1,12 @@
+[package]
+name = "proto-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Рабочий прототип FL-подобного интерфейса VibeStudio (egui); данные — реальный разбор .flp через flp_compat, остальное — заглушки"
+
+[dependencies]
+eframe = "0.31"
+flp_compat = { path = "../../crates/flp_compat" }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
