@@ -1,15 +1,18 @@
 //! `vibe_engine` — аудиодвижок VibeStudio.
 //!
-//! Слои: registry (команды) → engine (cpal live) → render (offline WAV).
-//! Данные проекта передаются снапшотами `NoteEvent` — движок не знает о UI
-//! и о формате FLP.
+//! Слои: commands (единый enum) → dispatch (модель+undo) → engine (cpal live
+//! + offline) → render (WAV). Движок владеет моделью проекта; UI читает
+//! снапшоты и шлёт команды.
 
+pub mod commands;
+pub mod dispatch;
 pub mod engine;
-pub mod registry;
+pub mod model;
 pub mod render;
 pub mod synth;
-pub mod voice;
+pub mod voices;
 
-pub use engine::{Engine, TransportSnapshot, TransportStatus};
-pub use registry::{ChannelVoice, EngineCommand, NoteEvent, PlayMode, VoiceSrc};
+pub use commands::{Command, NoteEvent, PlayMode, TransportStatus};
+pub use engine::{Engine, Shared, TICKS_PER_BAR};
 pub use render::render_to_wav;
+pub use model::{Channel, ChannelKind, Clip, ModelNote, Pattern, ProjectModel, FORMAT_VERSION};

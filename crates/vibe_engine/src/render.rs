@@ -1,59 +1,57 @@
-//! Offline-рендер в WAV: тот же PlayState/голоса, что и live-колбэк
-//! («what you hear is what you render»).
+//! Offline-рендер в WAV: тот же Shared/планировщик, что и в колбэке.
 
-use crate::engine::PlayState;
-use crate::registry::NoteEvent;
+use crate::commands::NoteEvent;
+use crate::engine::Shared;
 use hound::{WavSpec, WavWriter};
 use std::io::BufWriter;
 use std::path::Path;
 
-/// Отрендерить события в 16-бит стерео WAV (44100).
-/// `loops` — сколько раз прокрутить цикл (PAT: 2, SONG: 1).
+const SR: u32 = 44_100;
+
+/// Отрендерить события в 16-бит стерео WAV. `loops` — число проходов цикла.
+/// Работает без звуковой карты (та же модель/планировщик, что в колбэке).
 pub fn render_to_wav(
+    shared: &mut Shared,
     events: &[NoteEvent],
-    loop_ticks: f32,
+    loop_ticks: f64,
     bpm: f64,
     loops: u32,
     path: &Path,
 ) -> Result<u64, String> {
-    const SR: u32 = 44_100;
     let spec = WavSpec {
         channels: 2,
         sample_rate: SR,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut st = PlayState::new(SR as f32);
-    st.apply(crate::registry::EngineCommand::SetMasterGain { gain: 0.78 });
-    st.apply(crate::registry::EngineCommand::Play {
-        events: events.to_vec(),
-        loop_ticks,
-        mode: crate::registry::PlayMode::Pat,
-    });
-    // устанавливаем bpm после Play (Play не сбрасывает bpm, но для ясности)
-    st.apply(crate::registry::EngineCommand::SetBpm { bpm });
+    shared.set_sr(SR as f32);
+    shared.model.bpm = bpm;
+    shared.events = events.to_vec();
+    shared.loop_ticks = loop_ticks;
+    shared.epoch_samples = 0;
+    shared.tick_base = 0.0;
+    shared.next_event_index();
+    shared.start_playing();
 
-    let fpt = SR as f64 * 60.0 / (bpm * 96.0);
-    let total_frames = (loop_ticks as f64 * fpt).ceil() as u64 * loops.max(1) as u64;
+    let fpt = SR as f64 * 60.0 / (bpm * shared.model.ppq as f64);
+    let total_frames = (loop_ticks * fpt).ceil() as u64 * loops.max(1) as u64;
 
     let file = std::fs::File::create(path).map_err(|e| format!("файл: {e}"))?;
     let mut wav = WavWriter::new(BufWriter::new(file), spec).map_err(|e| format!("wav: {e}"))?;
-    let mut block = [0.0f32; 1024];
     let mut written = 0u64;
     while written < total_frames {
-        let n = ((total_frames - written).min(512) * 2) as usize;
-        let out = &mut block[..n];
-        out.fill(0.0);
-        st.advance(n / 2);
-        st.mix_block(out);
-        for frame in out.chunks_exact(2) {
+        let frames = ((total_frames - written).min(512)) as usize;
+        let mut block = vec![0.0f32; frames * 2];
+        shared.render_frame(&mut block);
+        for frame in block.chunks_exact(2) {
             let l = (frame[0].clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
             let r = (frame[1].clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
             wav.write_sample(l).map_err(|e| format!("wav: {e}"))?;
             wav.write_sample(r).map_err(|e| format!("wav: {e}"))?;
         }
-        written += (n / 2) as u64;
+        written += frames as u64;
     }
+    shared.status = crate::commands::TransportStatus::Stopped;
     wav.finalize().map_err(|e| format!("wav finalize: {e}"))?;
     Ok(written)
 }
