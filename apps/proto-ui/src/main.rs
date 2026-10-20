@@ -610,14 +610,14 @@ impl eframe::App for App {
         }
 
         self.top_toolbar(ctx);
-        if self.show_rack {
-            self.channel_rack_dock(ctx);
-        }
         if self.show_browser {
             self.browser(ctx);
         }
         self.status_bar(ctx);
         self.desktop(ctx);
+        if self.show_rack {
+            self.channel_rack_window(ctx);
+        }
         if self.show_playlist {
             self.playlist_window(ctx);
         }
@@ -912,11 +912,15 @@ impl App {
         }
     }
 
-    fn channel_rack_dock(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("rack_dock")
+    fn channel_rack_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_rack;
+        egui::Window::new("🔊 Channel rack — F6")
+            .open(&mut open)
+            .default_pos([340.0, 120.0])
+            .default_size([820.0, 300.0])
+            .min_width(680.0)
+            .min_height(180.0)
             .resizable(true)
-            .min_height(230.0)
-            .default_height(280.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.menu_button("▾", |ui| {
@@ -953,13 +957,6 @@ impl App {
                     })
                     .response
                     .on_hover_text("Добавить канал внизу списка (уникальный id, 16 шагов)");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let close = ui.add(egui::Button::new(egui::RichText::new("×").size(13.0)));
-                        self.set_hint(&close, "Скрыть Channel Rack (F6)");
-                        if close.clicked() {
-                            self.show_rack = false;
-                        }
-                    });
                 });
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -971,6 +968,7 @@ impl App {
                     }
                 });
             });
+        self.show_rack = open;
     }
 
     /// Ряд канала: фиксированные ширины колонок → шаги всех каналов строго
