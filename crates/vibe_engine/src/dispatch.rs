@@ -2,6 +2,8 @@
 //! возвращает обратную команду для undo/redo.
 
 use crate::commands::{Command, PlayMode, TransportStatus};
+
+pub use crate::commands::inverse as inverse_of;
 use crate::model::{Channel, ChannelKind, ProjectModel};
 use std::collections::VecDeque;
 
@@ -205,72 +207,6 @@ pub fn dispatch(model: &mut ProjectModel, cmd: &Command) -> Option<Command> {
         // транспортные команды модель не меняют
         C::Play | C::Pause | C::Stop | C::Seek { .. } | C::SetMode { .. }
         | C::PreviewNote { .. } => None,
-    }
-}
-
-/// Собрать события воспроизведения из модели (снапшот на момент вызова).
-/// PAT — выбранный паттерн; SONG — клипы по позициям (клип триггерит паттерн
-/// на своём диапазоне тактов).
-pub fn build_events(
-    model: &ProjectModel,
-    pattern_id: u32,
-    mode: PlayMode,
-    bars: u32,
-) -> (Vec<crate::commands::NoteEvent>, f32) {
-    const TICKS_PER_BAR: f32 = 384.0; // PPQ 96 × 4
-    const STEPS_PER_BAR: u32 = 16;
-    let mut ev = Vec::new();
-    let mut push_pattern = |ev: &mut Vec<crate::commands::NoteEvent>, offset_ticks: f32, pid: u32| {
-        let Some(p) = model.pattern(pid) else { return };
-        for (ch_id, step) in &p.steps {
-            let Some(ch) = model.channel(*ch_id) else { continue };
-            if ch.muted {
-                continue;
-            }
-            ev.push(crate::commands::NoteEvent {
-                tick: offset_ticks + *step as f32 * (TICKS_PER_BAR / STEPS_PER_BAR as f32),
-                channel_id: *ch_id,
-                key: 60,
-                vel: 100,
-                dur_ticks: TICKS_PER_BAR / STEPS_PER_BAR as f32,
-                gain: ch.volume,
-                pan: ch.pan,
-                kind: ch.kind,
-            });
-        }
-        for (ch_id, n) in &p.notes {
-            let Some(ch) = model.channel(*ch_id) else { continue };
-            if ch.muted {
-                continue;
-            }
-            ev.push(crate::commands::NoteEvent {
-                tick: offset_ticks + n.step as f32 * (TICKS_PER_BAR / STEPS_PER_BAR as f32),
-                channel_id: *ch_id,
-                key: n.key,
-                vel: n.vel,
-                dur_ticks: n.len_steps as f32 * (TICKS_PER_BAR / STEPS_PER_BAR as f32),
-                gain: ch.volume,
-                pan: ch.pan,
-                kind: ch.kind,
-            });
-        }
-    };
-    match mode {
-        PlayMode::Pat => {
-            push_pattern(&mut ev, 0.0, pattern_id);
-            (ev, bars as f32 * TICKS_PER_BAR)
-        }
-        PlayMode::Song => {
-            for c in &model.clips {
-                if c.muted || model.muted_tracks.contains(&c.track) {
-                    continue;
-                }
-                for b in 0..c.len_bars {
-                    push_pattern(&mut ev, (c.bar + b) as f32 * TICKS_PER_BAR, c.pattern_id);
-                }
-            }
-            (ev, bars as f32 * TICKS_PER_BAR)
-        }
     }
 }
 

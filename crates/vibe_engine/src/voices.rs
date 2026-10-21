@@ -1,25 +1,31 @@
 //! Пул голосов фиксированного размера: в аудио-callback ни одной аллокации.
-//! Источник сэмпла Sampler — Arc (клон без аллокаций).
+//! Живые громкость/панорама канала читаются из срезов RT-массивов на каждый
+//! блок (изменение ручки слышно на звучащих голосах, как в LMMS).
+//! Sampler проигрывает сэмпл с питчем по MIDI-ключу (линейная интерполяция).
 
 use crate::model::ChannelKind;
-use crate::synth;
 use std::sync::Arc;
 
 pub const POOL_SIZE: usize = 64;
+const HALF_PI: f32 = std::f32::consts::FRAC_PI_4;
 
 /// Звучащий голос. `delay` — семплов тишины до старта (sample-accurate).
 pub struct Voice {
     pub kind: ChannelKind,
+    pub channel_id: u32,
     freq: f32,
     sr: f32,
     delay: usize,
     frames_left: usize,
     frames_total: usize,
-    gain: f32,
-    pan: f32,
+    /// Гейн ноты (velocity × gain канала на момент спавна; живой volume
+    /// канала умножается поверх на каждом блоке).
+    note_gain: f32,
     phase: f32,
     sample: Option<Arc<Vec<f32>>>,
-    sample_pos: usize,
+    /// Позиция в сэмпле (float — для интерполяции при pitch-сдвиге).
+    sample_pos: f32,
+    sample_ratio: f32,
 }
 
 pub struct VoicePool {
@@ -32,36 +38,36 @@ impl VoicePool {
         VoicePool { slots: (0..POOL_SIZE).map(|_| None).collect() }
     }
 
-    /// Положить голос в свободный слот. Если пул полон — вытесняем самый
-    /// «старый» (первый занятый): правило прототипа, без роста буфера.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         &mut self,
         kind: ChannelKind,
+        channel_id: u32,
         key: u16,
         dur_secs: f32,
-        gain: f32,
-        pan: f32,
+        note_gain: f32,
         delay: usize,
         sr: f32,
         sample: Option<Arc<Vec<f32>>>,
     ) {
         let voice = Voice {
             kind,
-            freq: synth::key_freq(key),
+            channel_id,
+            freq: crate::synth::key_freq(key),
             sr,
             delay,
             frames_left: (dur_secs.max(0.01) * sr) as usize,
             frames_total: (dur_secs.max(0.01) * sr) as usize,
-            gain,
-            pan: pan.clamp(-1.0, 1.0),
+            note_gain,
             phase: 0.0,
+            sample_ratio: 2.0f32.powf((key as f32 - 60.0) / 12.0),
             sample,
-            sample_pos: 0,
+            sample_pos: 0.0,
         };
         match self.slots.iter_mut().position(|s| s.is_none()) {
             Some(i) => self.slots[i] = Some(voice),
             None => {
-                // вытеснение: ищем голос с наибольшим frames_left (дольше звучит)
+                // вытеснение: самый «долгий» голос (правило прототипа, без роста)
                 let victim = self
                     .slots
                     .iter()
@@ -75,22 +81,28 @@ impl VoicePool {
         }
     }
 
-    /// Смешать все голоса в стерео-блок; освободившиеся слоты обнуляются.
-    pub fn mix_block(&mut self, out: &mut [f32], kick: &[f32]) {
+    /// Смешать все голоса; живые громкость/панорама — из срезов каналов;
+    /// пики по каналам аккумулируются в `peaks` (спад делает caller).
+    pub fn mix_block(
+        &mut self,
+        out: &mut [f32],
+        kick: &[f32],
+        ch_vol: &[f32],
+        ch_pan: &[f32],
+        peaks: &mut [f32],
+    ) {
         for slot in self.slots.iter_mut() {
             let Some(v) = slot.as_mut() else { continue };
-            // задержка старта (sample-accurate планирование)
             if v.delay > 0 {
                 let skip = v.delay.min(out.len() / 2);
                 v.delay -= skip;
                 if v.delay > 0 {
                     continue;
                 }
-                // обрезаем первую часть блока: смешиваем с offset
                 let off = skip * 2;
-                mix_one(v, &mut out[off..], kick);
+                mix_one(v, &mut out[off..], kick, ch_vol, ch_pan, peaks);
             } else {
-                mix_one(v, out, kick);
+                mix_one(v, out, kick, ch_vol, ch_pan, peaks);
             }
             if v.frames_left == 0 {
                 *slot = None;
@@ -106,9 +118,20 @@ impl VoicePool {
     }
 }
 
-fn mix_one(v: &mut Voice, out: &mut [f32], kick: &[f32]) {
-    let angle = (v.pan + 1.0) * std::f32::consts::FRAC_PI_4;
+fn mix_one(
+    v: &mut Voice,
+    out: &mut [f32],
+    kick: &[f32],
+    ch_vol: &[f32],
+    ch_pan: &[f32],
+    peaks: &mut [f32],
+) {
+    let vol = ch_vol.get(v.channel_id as usize).copied().unwrap_or(0.78);
+    let pan = ch_pan.get(v.channel_id as usize).copied().unwrap_or(0.0);
+    let angle = (pan + 1.0) * HALF_PI;
     let (gl, gr) = (angle.cos(), angle.sin());
+    let gain = v.note_gain * vol;
+    let mut peak = 0.0f32;
     for frame in out.chunks_exact_mut(2) {
         if v.frames_left == 0 {
             break;
@@ -119,12 +142,11 @@ fn mix_one(v: &mut Voice, out: &mut [f32], kick: &[f32]) {
         let env = attack * (1.0 - t) * (1.0 - t);
         let s = match v.kind {
             ChannelKind::Kick => {
-                let val = kick.get(v.sample_pos).copied().unwrap_or(0.0);
-                v.sample_pos += 1;
+                let val = kick.get(v.sample_pos as usize).copied().unwrap_or(0.0);
+                v.sample_pos += 1.0;
                 val
             }
             ChannelKind::Synth => {
-                // пила + лёгкая гармоника
                 v.phase = (v.phase + v.freq / v.sr) % 1.0;
                 let saw = 2.0 * v.phase - 1.0;
                 let sine = (v.phase * std::f32::consts::TAU).sin();
@@ -132,20 +154,27 @@ fn mix_one(v: &mut Voice, out: &mut [f32], kick: &[f32]) {
             }
             ChannelKind::Sampler => match &v.sample {
                 Some(s) => {
-                    let val = s.get(v.sample_pos).copied().unwrap_or(0.0);
-                    v.sample_pos += 1;
+                    // линейная интерполяция: питч по ключу
+                    let i = v.sample_pos as usize;
+                    let frac = v.sample_pos - i as f32;
+                    let a = s.get(i).copied().unwrap_or(0.0);
+                    let b = s.get(i + 1).copied().unwrap_or(a);
+                    let val = a + (b - a) * frac;
+                    v.sample_pos += v.sample_ratio;
                     val
                 }
                 None => {
-                    // нет сэмпла — фолбэк на кик
-                    let val = kick.get(v.sample_pos).copied().unwrap_or(0.0);
-                    v.sample_pos += 1;
+                    let val = kick.get(v.sample_pos as usize).copied().unwrap_or(0.0);
+                    v.sample_pos += 1.0;
                     val
                 }
             },
         };
-        let x = s * env * v.gain;
+        let x = s * env * gain;
         frame[0] += x * gl;
         frame[1] += x * gr;
+        peak = peak.max(x.abs());
     }
+    let ch_idx = (v.channel_id as usize).min(peaks.len().saturating_sub(1));
+    peaks[ch_idx] = peaks[ch_idx].max(peak);
 }

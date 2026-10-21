@@ -1,4 +1,5 @@
-//! Offline-рендер в WAV: тот же Shared/планировщик, что и в колбэке.
+//! Offline-рендер в WAV: тот же Shared/планировщик, что и в колбэке
+//! («what you hear is what you render»).
 
 use crate::commands::NoteEvent;
 use crate::engine::Shared;
@@ -8,8 +9,8 @@ use std::path::Path;
 
 const SR: u32 = 44_100;
 
-/// Отрендерить события в 16-бит стерео WAV. `loops` — число проходов цикла.
-/// Работает без звуковой карты (та же модель/планировщик, что в колбэке).
+/// Отрендерить модель/события в 16-бит стерео WAV. `loops` — проходов цикла.
+/// Работает без звуковой карты: тот же Shared, планирование сканированием.
 pub fn render_to_wav(
     shared: &mut Shared,
     events: &[NoteEvent],
@@ -26,12 +27,9 @@ pub fn render_to_wav(
     };
     shared.set_sr(SR as f32);
     shared.model.bpm = bpm;
-    shared.events = events.to_vec();
-    shared.loop_ticks = loop_ticks;
     shared.epoch_samples = 0;
     shared.tick_base = 0.0;
-    shared.next_event_index();
-    shared.start_playing();
+    shared.start_playing_with(events, loop_ticks);
 
     let fpt = SR as f64 * 60.0 / (bpm * shared.model.ppq as f64);
     let total_frames = (loop_ticks * fpt).ceil() as u64 * loops.max(1) as u64;

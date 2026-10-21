@@ -378,12 +378,15 @@ impl App {
             return;
         };
         let mut sh = self.engine.lock();
-        sh.replan();
-        let events = sh.events.clone();
-        let loop_ticks = sh.loop_ticks;
+        // offline: транспорт из модели; длина цикла по режиму
+        let loop_ticks = if self.pattern_mode {
+            self.engine.model_snapshot().patterns.len() as f64 * 384.0
+        } else {
+            sh.song_bars() as f64 * 384.0
+        };
         let bpm = sh.model.bpm;
         let loops = if self.pattern_mode { 2 } else { 1 };
-        match vibe_engine::render_to_wav(&mut sh, &events, loop_ticks, bpm, loops, &path) {
+        match vibe_engine::render_to_wav(&mut sh, &[], loop_ticks, bpm, loops, &path) {
             Ok(frames) => {
                 let secs = frames as f64 / 44_100.0;
                 self.hint = format!("Экспорт: {frames} кадров ({secs:.1} c) → {}", path.display());
@@ -1719,18 +1722,15 @@ impl App {
                     ui.horizontal(|ui| {
                         let m = self.engine.model_snapshot();
                         let master_peak = self.engine.peak();
-                        let active = self.engine.active_mask();
-                        // Master
                         let master_vol = m.master_volume;
                         self.mixer_strip(ui, 0, "Master", master_vol, 0.5, false, master_peak, true, &mut |this, vol, pan| {
                             this.engine.execute(Command::SetMasterVolume { volume: vol });
                             let _ = pan;
                         });
                         ui.separator();
-                        // каналы (первые 10)
+                        // каналы (первые 10): метр канала — Master * громкость канала
                         for ch in m.channels.iter().take(10) {
-                            let active = active & (1u32 << ch.id.min(31)) != 0;
-                            let peak = if active { master_peak * ch.volume } else { 0.0 };
+                            let peak = master_peak * ch.volume;
                             let name = ch.name.clone();
                             let id = ch.id;
                             let muted = ch.muted;
