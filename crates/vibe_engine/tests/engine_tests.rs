@@ -146,9 +146,10 @@ fn wav_export_roundtrip() {
     let mut sh = shared_with_kick_on_steps(&[0, 4, 8, 12]);
     sh.apply(&Command::Play);
     let path = std::env::temp_dir().join("vibe_phase1.wav");
-    let loop_ticks = sh.loop_ticks;
-    let frames = vibe_engine::render_to_wav(&mut sh, &[], loop_ticks, 120.0, 1, &path)
+    let loop_ticks = sh.loop_ticks; // PAT: длина по содержимому (1 такт шагов 0/4/8/12 → 1 такт)
+    let frames = vibe_engine::render_to_wav(&mut sh, &[], loop_ticks, 120.0, 2, &path)
         .expect("рендер");
+    // 2 прохода × 1 такт × 2 c = 4 c → 176400 кадров
     assert!((176_000..=176_800).contains(&frames), "кадров {frames}");
     let reader = hound::WavReader::open(&path).unwrap();
     assert_eq!(reader.spec().sample_rate, 44_100);

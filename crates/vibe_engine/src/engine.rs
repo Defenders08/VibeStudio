@@ -116,6 +116,20 @@ impl Shared {
             .max(4)
     }
 
+    /// Длина ПАТТЕРНА в тактах по содержимому: сколько шагов/нот написано,
+    /// столько и играет (минимум 1 такт). «Сколько квадратов — столько играет».
+    pub fn pat_bars(&self) -> u32 {
+        let Some(p) = self.model.pattern(self.pattern_id) else { return 1 };
+        let max_step = p
+            .steps
+            .iter()
+            .map(|(_, s)| *s)
+            .chain(p.notes.iter().map(|(_, n)| n.step + n.len_steps.max(1)))
+            .max()
+            .unwrap_or(0);
+        ((max_step / 16) + 1).max(1) // 16 шагов на такт
+    }
+
     /// Применить команду (общий путь колбэка, silent-режима и тестов).
     pub fn apply(&mut self, cmd: &Command) {
         match cmd {
@@ -126,7 +140,7 @@ impl Shared {
                 }
                 self.loop_ticks = match self.mode {
                     PlayMode::Song => self.song_bars() as f64 * TICKS_PER_BAR,
-                    PlayMode::Pat => self.bars as f64 * TICKS_PER_BAR,
+                    PlayMode::Pat => self.pat_bars() as f64 * TICKS_PER_BAR,
                 };
                 self.epoch_samples = 0;
                 self.tick_base = 0.0;
@@ -160,7 +174,7 @@ impl Shared {
                 let pos = self.tick_now();
                 self.loop_ticks = match self.mode {
                     PlayMode::Song => self.song_bars() as f64 * TICKS_PER_BAR,
-                    PlayMode::Pat => self.bars as f64 * TICKS_PER_BAR,
+                    PlayMode::Pat => self.pat_bars() as f64 * TICKS_PER_BAR,
                 };
                 self.tick_base = if pos >= self.loop_ticks { pos % self.loop_ticks } else { pos };
                 self.epoch_samples = 0;
@@ -181,10 +195,18 @@ impl Shared {
             }
             // модельные — через диспетчер; клипы в SONG меняют длину цикла
             other => {
+                let pattern_edit = matches!(
+                    other,
+                    Command::SetStep { .. }
+                        | Command::SetNote { .. }
+                        | Command::RemoveNote { .. }
+                );
                 dispatch(&mut self.model, other);
                 self.sync_channel_params();
                 if self.mode == PlayMode::Song {
                     self.loop_ticks = self.song_bars() as f64 * TICKS_PER_BAR;
+                } else if pattern_edit {
+                    self.loop_ticks = self.pat_bars() as f64 * TICKS_PER_BAR;
                 }
             }
         }
